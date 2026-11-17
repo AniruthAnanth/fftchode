@@ -564,6 +564,29 @@ FFTW_DEFINE_API(FFTW_MANGLE_QUAD, __float128, fftwq_complex)
 #endif /* FFTW3_H */
 
 
+/* ==== fftchode numerics switch ==== */
+/* mode 0 = baseline (bit-identical to FFTW 3.3.10), 1 = fast.  Read once from
+   FFTCHODE_NUMERICS=baseline|fast at first use unless set explicitly. */
+#include <atomic>
+#include <stdlib.h>
+#include <string.h>
+static std::atomic<int> fftchode_numerics_state(-1);
+extern "C" void fftchode_set_numerics(int mode)
+{
+     fftchode_numerics_state.store(mode ? 1 : 0);
+}
+extern "C" int fftchode_numerics_mode(void)
+{
+     int m = fftchode_numerics_state.load(std::memory_order_relaxed);
+     if (m < 0) {
+	  const char *e = getenv("FFTCHODE_NUMERICS");
+	  int expected = -1;
+	  fftchode_numerics_state.compare_exchange_strong(expected, (e && !strcmp(e, "fast")) ? 1 : 0);
+	  m = fftchode_numerics_state.load();
+     }
+     return m;
+}
+
 #define FFT_CPP_INNER 1
 #ifndef FFT_NO_DOUBLE
 #define FFT_PREC_NS fftw_amalgamation_double
@@ -1764,6 +1787,7 @@ enum {
 /* fftchode: buffers that exist only to describe child problems during planning */
 extern "C" R *X(plan_scratch)(const planner *plnr, size_t n);
 extern "C" void X(plan_scratch_free)(R *p);
+extern "C" int fftchode_numerics_mode(void);
 extern "C" int X(shadow_ok)(const planner *plnr);
 extern "C" plan *X(mkplan_shadow)(planner *plnr, problem *prb, const plan *like,
 				enum wakefulness wakefulness);
@@ -8389,15 +8413,16 @@ typedef struct {
      R *W;      /* DFT(w) */
      plan *cldf;
      INT is, os;
+     int half;  /* fftchode fast mode: w and W stored by symmetry */
 } P;
 
-static void bluestein_sequence(enum wakefulness wakefulness, INT n, R *w)
+static void bluestein_sequence(enum wakefulness wakefulness, INT n, INT cnt, R *w)
 {
      INT k, ksq, n2 = 2 * n;
      triggen *t = X(mktriggen)(wakefulness, n2);
 
      ksq = 0;
-     for (k = 0; k < n; ++k) {
+     for (k = 0; k < cnt; ++k) {
 	  t->cexp(t, ksq, w+2*k);
           /* careful with overflow */
           ksq += 2*k + 1; while (ksq > n2) ksq -= n2;
@@ -8413,10 +8438,38 @@ static void mktwiddle(enum wakefulness wakefulness, P *p)
      R *w, *W;
      E nbf = (E)nb;
 
+     if (p->half) {
+	  /* n is an odd prime, so w[n-k] = -w[k]; the convolution kernel is
+	     even, so DFT(w)[nb-k] = DFT(w)[k].  Keep half of each. */
+	  INT nw = n / 2 + 1, nh = nb / 2 + 1;
+	  p->w = w = (R *) MALLOC(2 * nw * sizeof(R), TWIDDLES);
+	  bluestein_sequence(wakefulness, n, nw, w);
+	  W = (R *) MALLOC(2 * nb * sizeof(R), BUFFERS);
+	  for (i = 0; i < nb; ++i)
+	       W[2*i] = W[2*i+1] = K(0.0);
+	  W[0] = w[0] / nbf;
+	  W[1] = w[1] / nbf;
+	  for (i = 1; i < n; ++i) {
+	       E wr = i < nw ? w[2*i] : -w[2*(n-i)];
+	       E wi = i < nw ? w[2*i+1] : -w[2*(n-i)+1];
+	       W[2*i] = W[2*(nb-i)] = wr / nbf;
+	       W[2*i+1] = W[2*(nb-i)+1] = wi / nbf;
+	  }
+	  {
+	       plan_dft *cldf = (plan_dft *)p->cldf;
+	       cldf->apply(p->cldf, W, W+1, W, W+1);
+	  }
+	  p->W = (R *) MALLOC(2 * nh * sizeof(R), TWIDDLES);
+	  for (i = 0; i < 2 * nh; ++i)
+	       p->W[i] = W[i];
+	  X(ifree)(W);
+	  return;
+     }
+
      p->w = w = (R *) MALLOC(2 * n * sizeof(R), TWIDDLES);
      p->W = W = (R *) MALLOC(2 * nb * sizeof(R), TWIDDLES);
 
-     bluestein_sequence(wakefulness, n, w);
+     bluestein_sequence(wakefulness, n, n, w);
 
      for (i = 0; i < nb; ++i)
           W[2*i] = W[2*i+1] = K(0.0);
@@ -8436,12 +8489,75 @@ static void mktwiddle(enum wakefulness wakefulness, P *p)
      }
 }
 
+static void apply_half(const P *ego, R *ri, R *ii, R *ro, R *io, R *b)
+{
+     INT i, n = ego->n, nb = ego->nb, is = ego->is, os = ego->os;
+     INT nw = n / 2 + 1, nh = nb / 2 + 1;
+     const R *w = ego->w, *W = ego->W;
+
+     for (i = 0; i < nw; ++i) {
+	  E xr = ri[i*is], xi = ii[i*is];
+          E wr = w[2*i], wi = w[2*i+1];
+          b[2*i] = xr * wr + xi * wi;
+          b[2*i+1] = xi * wr - xr * wi;
+     }
+     for (; i < n; ++i) {
+	  E xr = ri[i*is], xi = ii[i*is];
+          E wr = -w[2*(n-i)], wi = -w[2*(n-i)+1];
+          b[2*i] = xr * wr + xi * wi;
+          b[2*i+1] = xi * wr - xr * wi;
+     }
+     for (; i < nb; ++i) b[2*i] = b[2*i+1] = K(0.0);
+
+     {
+          plan_dft *cldf = (plan_dft *)ego->cldf;
+          cldf->apply(ego->cldf, b, b+1, b, b+1);
+     }
+
+     for (i = 0; i < nh; ++i) {
+	  E xr = b[2*i], xi = b[2*i+1];
+          E wr = W[2*i], wi = W[2*i+1];
+          b[2*i] = xi * wr + xr * wi;
+          b[2*i+1] = xr * wr - xi * wi;
+     }
+     for (; i < nb; ++i) {
+	  E xr = b[2*i], xi = b[2*i+1];
+          E wr = W[2*(nb-i)], wi = W[2*(nb-i)+1];
+          b[2*i] = xi * wr + xr * wi;
+          b[2*i+1] = xr * wr - xi * wi;
+     }
+
+     {
+          plan_dft *cldf = (plan_dft *)ego->cldf;
+          cldf->apply(ego->cldf, b, b+1, b, b+1);
+     }
+
+     for (i = 0; i < nw; ++i) {
+	  E xi = b[2*i], xr = b[2*i+1];
+          E wr = w[2*i], wi = w[2*i+1];
+          ro[i*os] = xr * wr + xi * wi;
+          io[i*os] = xi * wr - xr * wi;
+     }
+     for (; i < n; ++i) {
+	  E xi = b[2*i], xr = b[2*i+1];
+          E wr = -w[2*(n-i)], wi = -w[2*(n-i)+1];
+          ro[i*os] = xr * wr + xi * wi;
+          io[i*os] = xi * wr - xr * wi;
+     }
+}
+
 static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 {
      const P *ego = (const P *) ego_;
      INT i, n = ego->n, nb = ego->nb, is = ego->is, os = ego->os;
      R *w = ego->w, *W = ego->W;
      R *b = (R *) MALLOC(2 * nb * sizeof(R), BUFFERS);
+
+     if (ego->half) {
+	  apply_half(ego, ri, ii, ro, io, b);
+	  X(ifree)(b);
+	  return;
+     }
 
      /* multiply input by conjugate bluestein sequence */
      for (i = 0; i < n; ++i) {
@@ -8579,6 +8695,7 @@ static plan *mkplan(const solver *ego, const problem *p_, planner *plnr)
      pln->cldf = cldf;
      pln->is = p->sz->dims[0].is;
      pln->os = p->sz->dims[0].os;
+     pln->half = fftchode_numerics_mode() == 1;
 
      X(ops_add)(&cldf->ops, &cldf->ops, &pln->super.super.ops);
      pln->super.super.ops.add += 4 * n + 2 * nb;
