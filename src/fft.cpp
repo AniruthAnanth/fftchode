@@ -748,7 +748,7 @@ static int fftchode_conflict(long n, long sbytes)
  * FFTCHODE_PLANBUDGET (plan budget) and FFTCHODE_PLANRAND (sigma,seed: random
  * cost perturbation for sampling plans). */
 #include <thread>
-#define FFTCHODE_FC_SPAWN 3e4
+#define FFTCHODE_FC_SPAWN 1.2e5
 #define FFTCHODE_PLAN_BUDGET 10000
 static const double fftchode_fcw_default[36] = FFTCHODE_FCW_INIT;
 #ifdef FFTCHODE_PLANNER_CALIBRATE
