@@ -9538,7 +9538,7 @@ static plan *mkcldw(const ct_solver *ego_,
      }
 
      pln->k = ego->k;
-     if (!ego->bufferedp) FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, irs, ors);
+     FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, irs, ors);
      pln->rs = X(mkstride)(r, irs);
      pln->td = 0;
      pln->r = r;
@@ -10456,7 +10456,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      p = (const problem_dft *) p_;
      d = p->sz->dims;
      pln->k = ego->k;
-     if (!ego->bufferedp) FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, d[0].n, d[0].is, d[0].os);
+     FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, d[0].n, d[0].is, d[0].os);
      pln->n = d[0].n;
      pln->is = X(mkstride)(pln->n, d[0].is);
      pln->os = X(mkstride)(pln->n, d[0].os);
@@ -135186,7 +135186,7 @@ static plan *mkcldw(const hc2c_solver *ego_, rdft_kind kind,
 	  pln = MKPLAN_HC2C(P, &padt, extra_iter ? apply_extra_iter : apply);
 
      pln->k = ego->k;
-     if (!ego->bufferedp) FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, rs, rs);
+     FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, rs, rs);
      pln->td = 0;
      pln->r = r; pln->rs = X(mkstride)(r, rs);
      pln->m = m; pln->ms = ms;
@@ -136557,7 +136557,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      n = d[0].n;
 
      pln->k = ego->k;
-     if (!ego->bufferedp) FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, n, rs, cs);
+     FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, n, rs, cs);
      pln->n = n;
 
      pln->rs0 = rs;
@@ -137452,7 +137452,7 @@ static plan *mkcldw(const hc2hc_solver *ego_,
      pln = MKPLAN_HC2HC(P, &padt, ego->bufferedp ? apply_buf : apply);
 
      pln->k = ego->k;
-     if (!ego->bufferedp) FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, rs, rs);
+     FFTCHODE_STRIDE_FALLBACK(pln->k, ego->desc, r, rs, rs);
      pln->td = 0;
      pln->r = r; pln->rs = X(mkstride)(r, rs);
      pln->m = m; pln->ms = ms;
