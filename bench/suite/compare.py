@@ -3,17 +3,30 @@
 
   compare.py --suite bench/suite/frozen.txt --threads 1 --rounds 10 --out DIR  base=BIN cand=BIN [...]
 
-Each round runs every binary once over the whole suite (order rotates every round), each
-binary pinned with taskset (--cpus, default: cpu 2 for 1 thread, all cpus otherwise).
-Per case and binary, the statistic is the median over all batches of all rounds. The
+Each round runs every case once per binary, interleaved case by case (one short process per
+case and binary, order rotating), so host-side contention hits A and B alike. Binaries are
+pinned with taskset (--cpus, default: cpu 2 for 1 thread, all cpus otherwise). Per round the
+value is the minimum over that round's batches; the statistic is the median over rounds.
+Hypervisor steal time per round is logged. The
 speedup of X over the first binary is median_t(first)/median_t(X); the suite figure is the
 geometric mean over cases. 95% CIs come from a paired bootstrap over rounds.
 Writes DIR/raw-<label>-t<threads>.txt (all rounds) and DIR/cmp-t<threads>.csv.
 """
 import argparse, math, os, random, statistics, subprocess, sys, time
 
-def run(bin_, suite, threads, cpus, batches, tmin):
+def steal():
+    f = open("/proc/stat").readline().split(); return int(f[8])
+
+def cases_of(suite):
+    out = []
+    for line in open(suite):
+        f = line.split()
+        if len(f) == 7 and not line.startswith("#"): out.append(f[0])
+    return out
+
+def run(bin_, suite, threads, cpus, batches, tmin, only=None):
     cmd = ["taskset", "-c", cpus, bin_, "--suite", suite, "--threads", str(threads), "--batches", str(batches), "--tmin", str(tmin)]
+    if only: cmd += ["--only", only]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
     res = {}
     for line in out.splitlines():
@@ -45,20 +58,24 @@ def main():
     else:
         fh = {lab: open(raws[lab], "w") for lab, _ in libs}
         t0 = time.time()
+        names = cases_of(a.suite)
         for r in range(a.rounds):
-            k = r % len(libs); order = libs[k:] + libs[:k]
-            for lab, b in order:
-                res = run(b, a.suite, a.threads, cpus, a.batches, a.tmin)
-                data[lab].append(res)
+            st0 = steal()
+            for lab, _ in libs: data[lab].append({})
+            for j, c in enumerate(names):
+                k = (r + j) % len(libs); order = libs[k:] + libs[:k]
+                for lab, b in order:
+                    data[lab][-1].update(run(b, a.suite, a.threads, cpus, a.batches, a.tmin, only=c))
+            for lab, _ in libs:
                 fh[lab].write("#round %d\n" % r)
-                for c, (p, ts) in res.items(): fh[lab].write("%s %.9g %s\n" % (c, p, " ".join("%.9g" % t for t in ts)))
+                for c, (p, ts) in data[lab][-1].items(): fh[lab].write("%s %.9g %s\n" % (c, p, " ".join("%.9g" % t for t in ts)))
                 fh[lab].flush()
-            print("[compare] t=%d round %d/%d done (%.0f s)" % (a.threads, r + 1, a.rounds, time.time() - t0), file=sys.stderr, flush=True)
+            print("[compare] t=%d round %d/%d done (%.0f s, steal %d ticks)" % (a.threads, r + 1, a.rounds, time.time() - t0, steal() - st0), file=sys.stderr, flush=True)
     labs = [lab for lab, _ in libs]; base = labs[0]
     R = min(len(data[l]) for l in labs)
     cases = [c for c in data[base][0] if all(c in data[l][i] for l in labs for i in range(R))]
     def med(lab, c, rounds):
-        return statistics.median([t for i in rounds for t in data[lab][i][c][1]])
+        return statistics.median([min(data[lab][i][c][1]) for i in rounds])
     def planmed(lab, c): return statistics.median([data[lab][i][c][0] for i in range(R)])
     allr = list(range(R)); rng = random.Random(12345)
     boots = [[rng.randrange(R) for _ in range(R)] for _ in range(a.boot)]
