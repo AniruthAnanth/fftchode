@@ -27,7 +27,7 @@ def cases_of(suite):
 def run(bin_, suite, threads, cpus, batches, tmin, only=None):
     cmd = ["taskset", "-c", cpus, bin_, "--suite", suite, "--threads", str(threads), "--batches", str(batches), "--tmin", str(tmin)]
     if only: cmd += ["--only", only]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
     res = {}
     for line in out.splitlines():
         f = line.split()
@@ -73,14 +73,17 @@ def main():
             print("[compare] t=%d round %d/%d done (%.0f s, steal %d ticks)" % (a.threads, r + 1, a.rounds, time.time() - t0, steal() - st0), file=sys.stderr, flush=True)
     labs = [lab for lab, _ in libs]; base = labs[0]
     R = min(len(data[l]) for l in labs)
-    cases = [c for c in data[base][0] if all(c in data[l][i] for l in labs for i in range(R))]
+    def cases_for(lab): return [c for c in data[base][0] if all(c in data[l][i] for l in (base, lab) for i in range(R))]
     def med(lab, c, rounds):
         return statistics.median([min(data[lab][i][c][1]) for i in rounds])
     def planmed(lab, c): return statistics.median([data[lab][i][c][0] for i in range(R)])
+    cases = []
     allr = list(range(R)); rng = random.Random(12345)
     boots = [[rng.randrange(R) for _ in range(R)] for _ in range(a.boot)]
     rows = []; summ = []
     for lab in labs[1:]:
+        cases = cases_for(lab)
+        if not cases: summ.append("%s: no cases" % lab); continue
         sp = {c: med(base, c, allr) / med(lab, c, allr) for c in cases}
         gm = math.exp(sum(math.log(v) for v in sp.values()) / len(sp))
         bgm = []; bcase = {c: [] for c in cases}
