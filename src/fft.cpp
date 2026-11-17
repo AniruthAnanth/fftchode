@@ -579,8 +579,15 @@ FFTW_DEFINE_API(FFTW_MANGLE_QUAD, __float128, fftwq_complex)
 #ifdef __clang__
 #pragma STDC FP_CONTRACT OFF
 #endif
+#ifdef __clang__
 #define FFTCHODE_TARGET_AVX2 __attribute__((target("avx2")))
 #define FFTCHODE_TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq")))
+#else
+/* GCC ignores the STDC FP_CONTRACT pragma and contracts by default in GNU modes; avx512f
+   enables FMA, so keep contraction off in the copies whatever the build flags are. */
+#define FFTCHODE_TARGET_AVX2 __attribute__((target("avx2"), optimize("fp-contract=off")))
+#define FFTCHODE_TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq"), optimize("fp-contract=off")))
+#endif
 #include <stdlib.h>
 #include <string.h>
 static int fftchode_isa_level(void)
