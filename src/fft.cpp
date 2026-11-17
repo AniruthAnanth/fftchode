@@ -1931,6 +1931,14 @@ enum {
 #define NO_DHT_R2HCP(plnr) (PLNR_L(plnr) & NO_DHT_R2HC)
 #define NO_BUFFERINGP(plnr) (PLNR_L(plnr) & NO_BUFFERING)
 
+/* fftchode */
+extern "C" int fftchode_numerics_mode(void);
+extern "C" int X(shadow_ok)(const planner *plnr);
+extern "C" plan *X(mkplan_shadow)(planner *plnr, problem *prb, const plan *like,
+				enum wakefulness wakefulness);
+extern "C" INT X(colbuf_l1_lines)(INT s);
+extern "C" planner *X(the_planner)(void);
+
 typedef enum { FORGET_ACCURSED, FORGET_EVERYTHING } amnesia;
 
 typedef enum { 
@@ -3878,7 +3886,9 @@ static unsigned addmod(unsigned a, unsigned b, unsigned p)
 */
 static void sgrow(planner *ego)
 {
-     unsigned osiz = ego->slvdescsiz, nsiz = 1 + osiz + osiz / 4;
+     /* fftchode: start at the default configuration's solver count (805)
+        so that registration does not peak at old+new array sizes */
+     unsigned osiz = ego->slvdescsiz, nsiz = osiz ? 1 + osiz + osiz / 4 : 832;
      slvdesc *ntab = (slvdesc *)MALLOC(nsiz * sizeof(slvdesc), SLVDESCS);
      slvdesc *otab = ego->slvdescs;
      unsigned i;
@@ -4834,6 +4844,87 @@ static void check(hashtab *ht)
      }
 }
 #endif
+
+extern "C" printer *X(mkprinter_cnt)(size_t *cnt);
+extern "C" printer *X(mkprinter_str)(char *s);
+
+/* fftchode: shadows are planned at awake time, only for plans made without
+   measurement and without wisdom restrictions */
+extern "C" int X(shadow_ok)(const planner *plnr)
+{
+     return ESTIMATEP(plnr) && plnr->wisdom_state == WISDOM_NORMAL;
+}
+
+/* lines of a 32 KiB 8-way L1 (64-byte lines) that a column with this byte
+   stride can occupy: power-of-two strides map to few sets.  Column
+   buffering is used only below 512, i.e. when the stride aliases. */
+extern "C" INT X(colbuf_l1_lines)(INT s)
+{
+     INT a = 4096, b = s, t;
+     while (b) { t = a % b; a = b; b = t; }
+     return 8 * (4096 / (a > 64 ? a : 64));
+}
+
+
+/* plan printout without the parts that only describe data movement:
+   "directbuf/<k>-" is "direct-" with a copy, "/is=<k>", "/os=<k>" are strides */
+static char *structure_of(const plan *pln)
+{
+     size_t cnt = 0;
+     char *s, *d;
+     const char *q;
+     printer *pr = X(mkprinter_cnt)(&cnt);
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     s = (char *) MALLOC(cnt + 1, OTHER);
+     pr = X(mkprinter_str)(s);
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     for (q = d = s; *q; ) {
+	  if (!strncmp(q, "directbuf/", 10)) {
+	       q += 10;
+	       while (*q >= '0' && *q <= '9') ++q;
+	       if (*q == '-') ++q;
+	       memcpy(d, "direct-", 7); d += 7;
+	  } else if (!strncmp(q, "/is=", 4) || !strncmp(q, "/os=", 4)) {
+	       q += 4;
+	       if (*q == '-') ++q;
+	       while (*q >= '0' && *q <= '9') ++q;
+	  } else
+	       *d++ = *q++;
+     }
+     *d = 0;
+     return s;
+}
+
+/* Plan prb (consumed) as a shadow of the awake-time plan "like": unblessed and
+   single-threaded, so it never reaches exported wisdom (FORGET_ACCURSED drops
+   it after planning).  Returned awake only if its structure equals like's. */
+extern "C" plan *X(mkplan_shadow)(planner *plnr, problem *prb, const plan *like,
+				enum wakefulness wakefulness)
+{
+     flags_t flags = plnr->flags;
+     int nthr = plnr->nthr;
+     plan *sh;
+
+     plnr->flags.hash_info = 0;
+     plnr->nthr = 1;
+     sh = X(mkplan_d)(plnr, prb);
+     plnr->flags = flags;
+     plnr->nthr = nthr;
+
+     if (sh) {
+	  char *a = structure_of(sh), *b = structure_of(like);
+	  int same = !strcmp(a, b);
+	  X(ifree)(a); X(ifree)(b);
+	  if (!same) {
+	       X(plan_destroy_internal)(sh);
+	       return 0;
+	  }
+	  X(plan_awake)(sh, wakefulness);
+     }
+     return sh;
+}
 }
 #undef BLISS
 #undef CHECK_FOR_BOGOSITY
@@ -8422,15 +8513,16 @@ typedef struct {
      R *W;      /* DFT(w) */
      plan *cldf;
      INT is, os;
+     int half;  /* fftchode fast mode: w and W stored by symmetry */
 } P;
 
-static void bluestein_sequence(enum wakefulness wakefulness, INT n, R *w)
+static void bluestein_sequence(enum wakefulness wakefulness, INT n, INT cnt, R *w)
 {
      INT k, ksq, n2 = 2 * n;
      triggen *t = X(mktriggen)(wakefulness, n2);
 
      ksq = 0;
-     for (k = 0; k < n; ++k) {
+     for (k = 0; k < cnt; ++k) {
 	  t->cexp(t, ksq, w+2*k);
           /* careful with overflow */
           ksq += 2*k + 1; while (ksq > n2) ksq -= n2;
@@ -8446,10 +8538,38 @@ static void mktwiddle(enum wakefulness wakefulness, P *p)
      R *w, *W;
      E nbf = (E)nb;
 
+     if (p->half) {
+	  /* n is an odd prime, so w[n-k] = -w[k]; the convolution kernel is
+	     even, so DFT(w)[nb-k] = DFT(w)[k].  Keep half of each. */
+	  INT nw = n / 2 + 1, nh = nb / 2 + 1;
+	  p->w = w = (R *) MALLOC(2 * nw * sizeof(R), TWIDDLES);
+	  bluestein_sequence(wakefulness, n, nw, w);
+	  W = (R *) MALLOC(2 * nb * sizeof(R), BUFFERS);
+	  for (i = 0; i < nb; ++i)
+	       W[2*i] = W[2*i+1] = K(0.0);
+	  W[0] = w[0] / nbf;
+	  W[1] = w[1] / nbf;
+	  for (i = 1; i < n; ++i) {
+	       E wr = i < nw ? w[2*i] : -w[2*(n-i)];
+	       E wi = i < nw ? w[2*i+1] : -w[2*(n-i)+1];
+	       W[2*i] = W[2*(nb-i)] = wr / nbf;
+	       W[2*i+1] = W[2*(nb-i)+1] = wi / nbf;
+	  }
+	  {
+	       plan_dft *cldf = (plan_dft *)p->cldf;
+	       cldf->apply(p->cldf, W, W+1, W, W+1);
+	  }
+	  p->W = (R *) MALLOC(2 * nh * sizeof(R), TWIDDLES);
+	  for (i = 0; i < 2 * nh; ++i)
+	       p->W[i] = W[i];
+	  X(ifree)(W);
+	  return;
+     }
+
      p->w = w = (R *) MALLOC(2 * n * sizeof(R), TWIDDLES);
      p->W = W = (R *) MALLOC(2 * nb * sizeof(R), TWIDDLES);
 
-     bluestein_sequence(wakefulness, n, w);
+     bluestein_sequence(wakefulness, n, n, w);
 
      for (i = 0; i < nb; ++i)
           W[2*i] = W[2*i+1] = K(0.0);
@@ -8469,12 +8589,75 @@ static void mktwiddle(enum wakefulness wakefulness, P *p)
      }
 }
 
+static void apply_half(const P *ego, R *ri, R *ii, R *ro, R *io, R *b)
+{
+     INT i, n = ego->n, nb = ego->nb, is = ego->is, os = ego->os;
+     INT nw = n / 2 + 1, nh = nb / 2 + 1;
+     const R *w = ego->w, *W = ego->W;
+
+     for (i = 0; i < nw; ++i) {
+	  E xr = ri[i*is], xi = ii[i*is];
+          E wr = w[2*i], wi = w[2*i+1];
+          b[2*i] = xr * wr + xi * wi;
+          b[2*i+1] = xi * wr - xr * wi;
+     }
+     for (; i < n; ++i) {
+	  E xr = ri[i*is], xi = ii[i*is];
+          E wr = -w[2*(n-i)], wi = -w[2*(n-i)+1];
+          b[2*i] = xr * wr + xi * wi;
+          b[2*i+1] = xi * wr - xr * wi;
+     }
+     for (; i < nb; ++i) b[2*i] = b[2*i+1] = K(0.0);
+
+     {
+          plan_dft *cldf = (plan_dft *)ego->cldf;
+          cldf->apply(ego->cldf, b, b+1, b, b+1);
+     }
+
+     for (i = 0; i < nh; ++i) {
+	  E xr = b[2*i], xi = b[2*i+1];
+          E wr = W[2*i], wi = W[2*i+1];
+          b[2*i] = xi * wr + xr * wi;
+          b[2*i+1] = xr * wr - xi * wi;
+     }
+     for (; i < nb; ++i) {
+	  E xr = b[2*i], xi = b[2*i+1];
+          E wr = W[2*(nb-i)], wi = W[2*(nb-i)+1];
+          b[2*i] = xi * wr + xr * wi;
+          b[2*i+1] = xr * wr - xi * wi;
+     }
+
+     {
+          plan_dft *cldf = (plan_dft *)ego->cldf;
+          cldf->apply(ego->cldf, b, b+1, b, b+1);
+     }
+
+     for (i = 0; i < nw; ++i) {
+	  E xi = b[2*i], xr = b[2*i+1];
+          E wr = w[2*i], wi = w[2*i+1];
+          ro[i*os] = xr * wr + xi * wi;
+          io[i*os] = xi * wr - xr * wi;
+     }
+     for (; i < n; ++i) {
+	  E xi = b[2*i], xr = b[2*i+1];
+          E wr = -w[2*(n-i)], wi = -w[2*(n-i)+1];
+          ro[i*os] = xr * wr + xi * wi;
+          io[i*os] = xi * wr - xr * wi;
+     }
+}
+
 static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 {
      const P *ego = (const P *) ego_;
      INT i, n = ego->n, nb = ego->nb, is = ego->is, os = ego->os;
      R *w = ego->w, *W = ego->W;
      R *b = (R *) MALLOC(2 * nb * sizeof(R), BUFFERS);
+
+     if (ego->half) {
+	  apply_half(ego, ri, ii, ro, io, b);
+	  X(ifree)(b);
+	  return;
+     }
 
      /* multiply input by conjugate bluestein sequence */
      for (i = 0; i < n; ++i) {
@@ -8612,6 +8795,7 @@ static plan *mkplan(const solver *ego, const problem *p_, planner *plnr)
      pln->cldf = cldf;
      pln->is = p->sz->dims[0].is;
      pln->os = p->sz->dims[0].os;
+     pln->half = fftchode_numerics_mode() == 1;
 
      X(ops_add)(&cldf->ops, &cldf->ops, &pln->super.super.ops);
      pln->super.super.ops.add += 4 * n + 2 * nb;
@@ -12233,7 +12417,24 @@ typedef struct {
      INT vl;
      INT ivs, ovs;
      const S *solver;
+
+     /* fftchode column buffering: the child is an n-point transform with
+	large strides is/os and adjacent transforms are one complex apart
+	(MATLAB fft along dimension 2, the column passes of rank>=2 plans).
+	When awake, shadow is the same plan structure for the transform
+	written to a contiguous buffer, so that nb adjacent transforms are
+	computed with whole cache lines and every pass but the first stays
+	in cache.  Identical structure means identical arithmetic. */
+     INT n, is, os, nb, bd;
+     int inplace;
+     plan *shadow;
 } P;
+
+#define COLBUF_LINE 64
+#define COLBUF_MAXBUF ((INT)256 * 1024)
+#ifndef FFTCHODE_COLBUF_MIN
+#define FFTCHODE_COLBUF_MIN ((INT)256 * 1024)
+#endif
 
 static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 {
@@ -12242,21 +12443,86 @@ static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
      INT ivs = ego->ivs, ovs = ego->ovs;
      dftapply cldapply = ((plan_dft *) ego->cld)->apply;
 
-     for (i = 0; i < vl; ++i) {
+     i = 0;
+     if (ego->shadow) {
+	  INT j, k, n = ego->n, is = ego->is, os = ego->os;
+	  INT nb = ego->nb, bd = ego->bd;
+	  size_t bufsz = sizeof(R) * 2 * nb * bd;
+	  dftapply shapply = ((plan_dft *) ego->shadow)->apply;
+	  R *buf;
+
+	  BUF_ALLOC(R *, buf, bufsz);
+	  for (; i + nb <= vl; i += nb) {
+	       const R *xr = ri + i * ivs, *xi = ii + i * ivs;
+	       R *yr = ro + i * ovs, *yi = io + i * ovs;
+	       if (ego->inplace) {
+		    for (k = 0; k < n; ++k)
+			 for (j = 0; j < nb; ++j) {
+			      buf[2 * (j * bd + k)] = xr[k * is + j * ivs];
+			      buf[2 * (j * bd + k) + 1] = xi[k * is + j * ivs];
+			 }
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, buf + 2 * j * bd, buf + 2 * j * bd + 1,
+				 buf + 2 * j * bd, buf + 2 * j * bd + 1);
+	       } else {
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, ri + (i + j) * ivs, ii + (i + j) * ivs,
+				 buf + 2 * j * bd, buf + 2 * j * bd + 1);
+	       }
+	       for (k = 0; k < n; ++k)
+		    for (j = 0; j < nb; ++j) {
+			 yr[k * os + j * ovs] = buf[2 * (j * bd + k)];
+			 yi[k * os + j * ovs] = buf[2 * (j * bd + k) + 1];
+		    }
+	  }
+	  BUF_FREE(buf, bufsz);
+     }
+
+     for (; i < vl; ++i) {
           cldapply(ego->cld,
                    ri + i * ivs, ii + i * ivs, ro + i * ovs, io + i * ovs);
      }
+}
+
+static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
+{
+     planner *plnr = X(the_planner)();
+     R *in, *out;
+     plan *sh;
+
+     if (!X(shadow_ok)(plnr))
+	  return 0;
+     in = (R *) MALLOC(sizeof(R) * 2 * (size_t)ego->n * (size_t)ego->is, BUFFERS);
+     out = ego->inplace ? in : (R *) MALLOC(sizeof(R) * 2 * ego->n, BUFFERS);
+     sh = X(mkplan_shadow)(plnr,
+			   X(mkproblem_dft_d)(
+				X(mktensor_1d)(ego->n, ego->inplace ? 2 : ego->is, 2),
+				X(mktensor_0d)(),
+				in, in + 1, out, out + 1),
+			   ego->cld, wakefulness);
+     if (!ego->inplace) X(ifree)(out);
+     X(ifree)(in);
+     return sh;
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
 {
      P *ego = (P *) ego_;
      X(plan_awake)(ego->cld, wakefulness);
+
+     if (ego->shadow) {
+	  X(plan_awake)(ego->shadow, SLEEPY);
+	  X(plan_destroy_internal)(ego->shadow);
+	  ego->shadow = 0;
+     }
+     if (ego->n && (wakefulness == AWAKE_SQRTN_TABLE || wakefulness == AWAKE_SINCOS))
+	  ego->shadow = mkshadow(ego, wakefulness);
 }
 
 static void destroy(plan *ego_)
 {
      P *ego = (P *) ego_;
+     if (ego->shadow) X(plan_destroy_internal)(ego->shadow);
      X(plan_destroy_internal)(ego->cld);
 }
 
@@ -12368,6 +12634,34 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 64))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
+
+     pln->n = 0;
+     pln->shadow = 0;
+     if (1
+	 && p->sz->rnk == 1
+	 && p->vecsz->rnk == 1
+	 && d->is == 2 && d->os == 2
+	 && UNTAINT(p->ii) == UNTAINT(p->ri) + 1
+	 && UNTAINT(p->io) == UNTAINT(p->ro) + 1) {
+	  const iodim *t = p->sz->dims;
+	  INT nb = COLBUF_LINE / (2 * (INT)sizeof(R));
+	  int inplace = UNTAINT(p->ri) == UNTAINT(p->ro);
+	  if (1
+	      && t->is >= 2 * nb && t->os >= 2 * nb
+	      && (!inplace || t->is == t->os)
+	      && pln->vl >= 2 * nb
+	      && 2 * nb * X(bufdist)(t->n, nb) * (INT)sizeof(R) <= COLBUF_MAXBUF
+	      && t->n * t->is * (INT)sizeof(R) >= FFTCHODE_COLBUF_MIN
+	      && X(colbuf_l1_lines)(t->os * (INT)sizeof(R)) < 512
+	      && t->n > X(colbuf_l1_lines)(t->os * (INT)sizeof(R))) {
+	       pln->n = t->n;
+	       pln->is = t->is;
+	       pln->os = t->os;
+	       pln->nb = nb;
+	       pln->bd = X(bufdist)(t->n, nb);
+	       pln->inplace = inplace;
+	  }
+     }
 
      return &(pln->super.super);
 }
@@ -141109,7 +141403,21 @@ typedef struct {
      INT vl;
      INT rvs, cvs;
      const S *solver;
+
+     /* fftchode column buffering for out-of-place r2c/c2r along MATLAB
+	dimension 2, as in dft/vrank-geq1.c: the strided output of nb
+	adjacent transforms goes through a contiguous buffer with a shadow
+	plan of identical structure */
+     INT n, rstride, cs, nb, bd;
+     rdft_kind kind;
+     plan *shadow;
 } P;
+
+#define COLBUF_LINE 64
+#define COLBUF_MAXBUF ((INT)256 * 1024)
+#ifndef FFTCHODE_COLBUF_MIN
+#define FFTCHODE_COLBUF_MIN ((INT)256 * 1024)
+#endif
 
 static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
 {
@@ -141118,21 +141426,94 @@ static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
      INT rvs = ego->rvs, cvs = ego->cvs;
      rdft2apply cldapply = ((plan_rdft2 *) ego->cld)->apply;
 
-     for (i = 0; i < vl; ++i) {
+     i = 0;
+     if (ego->shadow) {
+	  INT j, k, n = ego->n, nc = n / 2 + 1, rstride = ego->rstride, cs = ego->cs;
+	  INT nb = ego->nb, bd = ego->bd;
+	  size_t bufsz = sizeof(R) * nb * bd;
+	  rdft2apply shapply = ((plan_rdft2 *) ego->shadow)->apply;
+	  R *buf;
+
+	  BUF_ALLOC(R *, buf, bufsz);
+	  for (; i + nb <= vl; i += nb) {
+	       if (ego->kind == R2HC) {
+		    R *yr = cr + i * cvs, *yi = ci + i * cvs;
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, r0 + (i + j) * rvs, r1 + (i + j) * rvs,
+				 buf + j * bd, buf + j * bd + 1);
+		    for (k = 0; k < nc; ++k)
+			 for (j = 0; j < nb; ++j) {
+			      yr[k * cs + j * cvs] = buf[j * bd + 2 * k];
+			      yi[k * cs + j * cvs] = buf[j * bd + 2 * k + 1];
+			 }
+	       } else {
+		    R *y = r0 + i * rvs;
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, buf + j * bd, buf + j * bd + 1,
+				 cr + (i + j) * cvs, ci + (i + j) * cvs);
+		    for (k = 0; k < n; ++k)
+			 for (j = 0; j < nb; ++j)
+			      y[k * rstride + j * rvs] = buf[j * bd + k];
+	       }
+	  }
+	  BUF_FREE(buf, bufsz);
+     }
+
+     for (; i < vl; ++i) {
           cldapply(ego->cld, r0 + i * rvs, r1 + i * rvs,
 		   cr + i * cvs, ci + i * cvs);
      }
+}
+
+static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
+{
+     planner *plnr = X(the_planner)();
+     size_t insz;
+     R *in, *out;
+     plan *sh;
+
+     if (!X(shadow_ok)(plnr))
+	  return 0;
+     insz = sizeof(R) * (size_t)ego->n * (size_t)(ego->rstride > ego->cs ? ego->rstride : ego->cs);
+     in = (R *) MALLOC(insz, BUFFERS);
+     out = (R *) MALLOC(sizeof(R) * (ego->n + 2), BUFFERS);
+     if (ego->kind == R2HC)
+	  sh = X(mkplan_shadow)(plnr,
+				X(mkproblem_rdft2_d)(
+				     X(mktensor_1d)(ego->n, 2 * ego->rstride, 2),
+				     X(mktensor_0d)(),
+				     in, in + ego->rstride, out, out + 1, R2HC),
+				ego->cld, wakefulness);
+     else
+	  sh = X(mkplan_shadow)(plnr,
+				X(mkproblem_rdft2_d)(
+				     X(mktensor_1d)(ego->n, ego->cs, 2),
+				     X(mktensor_0d)(),
+				     out, out + 1, in, in + 1, HC2R),
+				ego->cld, wakefulness);
+     X(ifree)(out);
+     X(ifree)(in);
+     return sh;
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
 {
      P *ego = (P *) ego_;
      X(plan_awake)(ego->cld, wakefulness);
+
+     if (ego->shadow) {
+	  X(plan_awake)(ego->shadow, SLEEPY);
+	  X(plan_destroy_internal)(ego->shadow);
+	  ego->shadow = 0;
+     }
+     if (ego->n && (wakefulness == AWAKE_SQRTN_TABLE || wakefulness == AWAKE_SINCOS))
+	  ego->shadow = mkshadow(ego, wakefulness);
 }
 
 static void destroy(plan *ego_)
 {
      P *ego = (P *) ego_;
+     if (ego->shadow) X(plan_destroy_internal)(ego->shadow);
      X(plan_destroy_internal)(ego->cld);
 }
 
@@ -141250,6 +141631,40 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 128))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
+
+     pln->n = 0;
+     pln->shadow = 0;
+     if (1
+	 && p->sz->rnk == 1
+	 && p->vecsz->rnk == 1
+	 && (p->kind == R2HC || p->kind == HC2R)
+	 && rvs == 1 && cvs == 2
+	 && UNTAINT(p->ci) == UNTAINT(p->cr) + 1
+	 && UNTAINT(p->r0) != UNTAINT(p->cr)) {
+	  INT rs2, cs, n = p->sz->dims[0].n;
+	  INT rstride = UNTAINT(p->r1) - UNTAINT(p->r0);
+	  INT nb = COLBUF_LINE / (INT)sizeof(R);
+	  INT bd = X(bufdist)(n + 2, nb);
+	  X(rdft2_strides)(p->kind, p->sz->dims, &rs2, &cs);
+	  if (1
+	      && rs2 == 2 * rstride
+	      && rstride >= nb && cs >= 2 * nb
+	      && pln->vl >= 2 * nb
+	      && nb * bd * (INT)sizeof(R) <= COLBUF_MAXBUF
+	      && n * rstride * (INT)sizeof(R) >= FFTCHODE_COLBUF_MIN
+	      && (p->kind == R2HC
+		  ? (X(colbuf_l1_lines)(cs * (INT)sizeof(R)) < 512
+		     && n / 2 + 1 > X(colbuf_l1_lines)(cs * (INT)sizeof(R)))
+		  : (X(colbuf_l1_lines)(rstride * (INT)sizeof(R)) < 512
+		     && n > X(colbuf_l1_lines)(rstride * (INT)sizeof(R))))) {
+	       pln->n = n;
+	       pln->rstride = rstride;
+	       pln->cs = cs;
+	       pln->nb = nb;
+	       pln->bd = bd;
+	       pln->kind = p->kind;
+	  }
+     }
 
      return &(pln->super.super);
 }
