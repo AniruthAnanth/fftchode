@@ -9,7 +9,10 @@ cheapest by a cost that adds three terms to FFTW's operation count:
 - the child-plan calls a vector loop makes (`X(fc_loop)`);
 - codelet arithmetic weighted by register width (scalar, 128, 256, 512 bits) and codelet family
   (n1 n2 t1 t2 t3 q1 real), with a surcharge for radix > 16 (`X(fc_arith)`); SIMD codelets run on
-  fewer than VL transforms are charged for full vectors.
+  fewer than VL transforms are charged for full vectors;
+- for a threaded plan, the parallel part's cost divided by min(threads, hardware threads), plus a fixed
+  spawn/join charge per parallel region (`X(fc_thr)`, `FFTCHODE_FC_SPAWN`). FFTW sums the children's
+  counts and charges nothing for spawning, so without this term ESTIMATE threads tiny transforms.
 
 Baseline mode is untouched: plans, output bits and exported wisdom match baseline-v0 and FFTW 3.3.10
 (`make test-upstream`).

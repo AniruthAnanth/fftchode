@@ -24,10 +24,25 @@ GLOBAL = r'''/* ==== fftchode fast-mode ESTIMATE planner (opt/planner, FFTE-6) =
  * L1/L2/L3/DRAM, 6 child-plan calls in loops, 7-34 codelet arithmetic by
  * register width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1
  * real), 35 extra for codelets of radix > 16.
+ * A threaded plan (X(fc_thr)) costs its parallel part divided by the threads
+ * that can run at once, min(nthr, hardware threads), plus FFTCHODE_FC_SPAWN
+ * cost units per parallel region (1.2e5 units ~ 15 us on the calibration
+ * machine, where one unit is ~0.13 ns).
  * Building with -DFFTCHODE_PLANNER_CALIBRATE reads FFTCHODE_PLANW (36
- * comma-separated weights) and FFTCHODE_PLANRAND
- * (sigma,seed: random cost perturbation for sampling plans). */
+ * comma-separated weights), FFTCHODE_PLANSPAWN (spawn cost) and
+ * FFTCHODE_PLANRAND (sigma,seed: random cost perturbation for sampling plans). */
+#include <thread>
+#define FFTCHODE_FC_SPAWN 1.2e5
 static const double fftchode_fcw_default[36] = FFTCHODE_FCW_INIT;
+static int fftchode_ncpu(void)
+{
+     static int n = 0;
+     if (!n) {
+          unsigned h = std::thread::hardware_concurrency();
+          n = h ? (int)h : 1;
+     }
+     return n;
+}
 #ifdef FFTCHODE_PLANNER_CALIBRATE
 #include <cmath>
 static double fftchode_fcw_[36];
@@ -55,8 +70,14 @@ static const double *fftchode_fcw(void)
      if (!fftchode_fcw_init_) fftchode_fcw_load();
      return fftchode_fcw_;
 }
+static double fftchode_fc_spawn(void)
+{
+     const char *e = std::getenv("FFTCHODE_PLANSPAWN");
+     return e ? std::atof(e) : FFTCHODE_FC_SPAWN;
+}
 #else
 static const double *fftchode_fcw(void) { return fftchode_fcw_default; }
+static double fftchode_fc_spawn(void) { return FFTCHODE_FC_SPAWN; }
 #endif
 
 '''
@@ -93,24 +114,27 @@ rep('''typedef struct {
      /* fftchode fast mode: [0-3] cache lines fetched from L1, L2, L3, DRAM;
         [4] child-plan calls in loops; [5-32] codelet arithmetic by register
         width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1 real);
-        [33] arithmetic of codelets with radix > 16 */
-     double fcl[34];
+        [33] arithmetic of codelets with radix > 16; [34] cost-unit adjustment
+        for threaded plans (X(fc_thr)) */
+     double fcl[35];
 } opcnt;
 ''')
 i = s.index('} tensor;'); j = s.index('\n', i) + 1
 s = s[:j] + '''extern "C" void X(fc_mem)(opcnt *o, double k, INT n, INT s, INT v, INT vs, INT esz, INT vv, INT vvs);
 extern "C" void X(fc_loop)(opcnt *o, const tensor *sz, const tensor *vecsz, int vdim, INT esz);
 extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT gvl, const opcnt *c);
+extern "C" double X(fc_cost)(const opcnt *o);
+extern "C" void X(fc_thr)(opcnt *o, int nthr);
 ''' + s[j:]
 
 rep('''     dst->add = dst->mul = dst->fma = dst->other = 0;''', '''     int i;
      dst->add = dst->mul = dst->fma = dst->other = 0;
-     for (i = 0; i < 34; ++i) dst->fcl[i] = 0;''')
+     for (i = 0; i < 35; ++i) dst->fcl[i] = 0;''')
 rep('''     dst->other = m * a->other + b->other;
 }''', '''     dst->other = m * a->other + b->other;
      {
           int i;
-          for (i = 0; i < 34; ++i) dst->fcl[i] = m * a->fcl[i] + b->fcl[i];
+          for (i = 0; i < 35; ++i) dst->fcl[i] = m * a->fcl[i] + b->fcl[i];
      }
 }
 
@@ -218,18 +242,41 @@ extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT
      X(ops_madd2)(k - v * (cnt / gvl), c, o);
      o->fcl[5 + 7 * fc_width(nam) + fc_family(nam)] += a;
      if (r > 16) o->fcl[33] += a;
+}
+
+/* The fast-mode cost of an operation count, in the units of X(iestimate_cost). */
+extern "C" double X(fc_cost)(const opcnt *o)
+{
+     const double *w = ::fftchode_fcw(), *l = o->fcl;
+     double a = o->add + o->mul
+#if HAVE_FMA
+          + o->fma;
+#else
+          + 2 * o->fma;
+#endif
+     int i;
+     for (i = 5; i < 33; ++i) a -= l[i];
+     a = w[0] * a + w[1] * o->other;
+     for (i = 0; i < 34; ++i) a += w[2 + i] * l[i];
+     return a + l[34];
+}
+
+/* o holds the summed operation counts of the nthr children a threaded solver
+   runs in one parallel region: charge their cost divided by the threads that
+   run at once, plus the cost of spawning and joining the region.  FFTW's own
+   counts are left alone, so fftw_flops still reports the total work. */
+extern "C" void X(fc_thr)(opcnt *o, int nthr)
+{
+     int p = nthr < ::fftchode_ncpu() ? nthr : ::fftchode_ncpu();
+     if (nthr <= 1) return;
+     o->fcl[34] -= (1.0 - 1.0 / p) * X(fc_cost)(o) - ::fftchode_fc_spawn();
 }''')
 
 # ---------------------------------------------------------------- estimator
 rep('''\t  + pln->ops.other;
      if (ego->cost_hook)''', '''\t  + pln->ops.other;
      if (%s) {
-          const double *w = ::fftchode_fcw(), *l = pln->ops.fcl;
-          int i;
-          cost -= pln->ops.other;
-          for (i = 5; i < 33; ++i) cost -= l[i];
-          cost = w[0] * cost + w[1] * pln->ops.other;
-          for (i = 0; i < 34; ++i) cost += w[2 + i] * l[i];
+          cost = X(fc_cost)(&pln->ops);
 #ifdef FFTCHODE_PLANNER_CALIBRATE
           if (::fftchode_rand_[0] > 0) {
                md5 m;
@@ -459,6 +506,28 @@ if 'XSIMD_STRING("rdft2-pair")' in s:
      /* fast-mode cost model: real side n points x 2 b2 columns, complex side n/2+1 x 2 b2 */
      X(fc_mem)(&pln->super.super.ops, 1, 2 * b2, rv, n, rs, sizeof(R), npairs / b2, 2 * b2 * rv);
      X(fc_mem)(&pln->super.super.ops, 1, 2 * b2, cv, n / 2 + 1, cs, 2 * sizeof(R), npairs / b2, 2 * b2 * cv);''')
+
+# ---------------------------------------------------------------- threaded solvers
+rep('''     for (i = 0; i < nthr; ++i) {
+\t  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
+\t  pln->super.super.pcost += cldrn[i]->pcost;
+     }
+''', '''     for (i = 0; i < nthr; ++i) {
+\t  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
+\t  pln->super.super.pcost += cldrn[i]->pcost;
+     }
+     if (%s)
+\t  X(fc_thr)(&pln->super.super.ops, nthr);
+''' % FAST, 3)
+rep('''\t  pln->super.super.could_prune_now_p |= cldws[i]->could_prune_now_p;
+     }
+     X(ops_add2)(&cld->ops, &pln->super.super.ops);
+''', '''\t  pln->super.super.could_prune_now_p |= cldws[i]->could_prune_now_p;
+     }
+     if (%s)
+\t  X(fc_thr)(&pln->super.super.ops, nthr);
+     X(ops_add2)(&cld->ops, &pln->super.super.ops);
+''' % FAST, 2)
 
 open(p, 'w').write(s)
 print('planner patch applied to', p)
