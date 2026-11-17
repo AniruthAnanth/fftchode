@@ -1,5 +1,11 @@
 # Fidelity configuration: scalar code, no FMA contraction (matches MATLAB R2026b's FFTW build flags)
-CXX      ?= clang++
+# make predefines CXX (g++) and CC (cc), so ?= never applies: default to clang unless set
+ifeq ($(origin CXX),default)
+CXX      = clang++
+endif
+ifeq ($(origin CC),default)
+CC       = clang
+endif
 CXXFLAGS ?= -O2 -ffp-contract=off
 FFT_DEFS ?=
 PY       ?= python3
