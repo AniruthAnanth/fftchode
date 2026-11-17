@@ -198239,7 +198239,12 @@ namespace f432_fftchode_rdft2_embed {
  *   R2HC: Z = DFT(x + 0i), X[f] = Z[f] for f <= n/2
  *   HC2R: Z = Hermitian extension of X (imaginary part of X[0] ignored),
  *         x = Re IDFT(Z)
+ * Below EMBED_MIN_THREADED_N the complex child is planned single-threaded:
+ * FFTW's ESTIMATE cost has no charge for spawning threads, and a threaded
+ * child of a small embedded transform (e.g. Bluestein for n = 127) runs
+ * tens of times slower than the serial one (dev machine, 4 threads).
  */
+#define EMBED_MIN_THREADED_N 16384
 
 
 typedef struct {
@@ -198317,6 +198322,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      plan *cld;
      R *B;
      INT n, rs2, cs;
+     int nthr;
      static const plan_adt padt = {
 	  X(rdft2_solve), awake, print, destroy
      };
@@ -198337,11 +198343,15 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      n = p->sz->dims[0].n;
 
      B = (R *) MALLOC(sizeof(R) * 4 * n, BUFFERS);
+     nthr = plnr->nthr;
+     if (n < EMBED_MIN_THREADED_N)
+	  plnr->nthr = 1;
      cld = X(mkplan_d)(plnr,
 		       X(mkproblem_dft_d)(X(mktensor_1d)(n, 2, 2), X(mktensor_1d)(1, 0, 0),
 					  p->kind == R2HC ? B : B + 1, p->kind == R2HC ? B + 1 : B,
 					  p->kind == R2HC ? B + 2 * n : B + 2 * n + 1,
 					  p->kind == R2HC ? B + 2 * n + 1 : B + 2 * n));
+     plnr->nthr = nthr;
      X(ifree)(B);
      if (!cld)
 	  return (plan *) 0;
@@ -198368,6 +198378,7 @@ extern "C" void X(fftchode_rdft2_embed_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+#undef EMBED_MIN_THREADED_N
 }
 
 #if HAVE_SSE2
@@ -198443,6 +198454,7 @@ extern "C" void X(fftchode_rdft2_embed_register)(planner *p)
 #undef DOUBLE_ALIGNED
 #undef DS
 #undef DVK
+#undef EMBED_MIN_THREADED_N
 #undef EQV
 #undef ESTIMATED_AVAILABLE_INDEX_REGISTERS
 #undef ESTIMATEP
