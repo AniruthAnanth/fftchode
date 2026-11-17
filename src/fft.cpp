@@ -735,25 +735,22 @@ static int fftchode_conflict(long n, long sbytes)
  * L1/L2/L3/DRAM, 6 child-plan calls in loops, 7-34 codelet arithmetic by
  * register width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1
  * real), 35 extra for codelets of radix > 16.
- * A threaded plan (X(fc_thr)) costs its parallel part divided by the threads
- * that can run at once, min(nthr, hardware threads), plus FFTCHODE_FC_SPAWN
- * cost units per parallel region (1.2e5 units ~ 15 us on the calibration
- * machine, where one unit is ~0.13 ns).
+ * A threaded plan (X(fc_thr)) costs its parallel part divided by the lanes
+ * the thread pool will actually run it on (the CPUs in the process's affinity
+ * mask, fewer when the work is too small to wake a thread), plus
+ * FFTCHODE_FC_SPAWN cost units per parallel region (one unit is ~0.13 ns on
+ * the calibration machine).
+ * The unpruned search evaluates at most FFTCHODE_PLAN_BUDGET plans per
+ * top-level plan; after that it prunes as stock ESTIMATE does.  The budget is
+ * a count, not a time, so plans stay reproducible.
  * Building with -DFFTCHODE_PLANNER_CALIBRATE reads FFTCHODE_PLANW (36
- * comma-separated weights), FFTCHODE_PLANSPAWN (spawn cost) and
- * FFTCHODE_PLANRAND (sigma,seed: random cost perturbation for sampling plans). */
+ * comma-separated weights), FFTCHODE_PLANSPAWN (spawn cost),
+ * FFTCHODE_PLANBUDGET (plan budget) and FFTCHODE_PLANRAND (sigma,seed: random
+ * cost perturbation for sampling plans). */
 #include <thread>
 #define FFTCHODE_FC_SPAWN 1.2e5
+#define FFTCHODE_PLAN_BUDGET 10000
 static const double fftchode_fcw_default[36] = FFTCHODE_FCW_INIT;
-static int fftchode_ncpu(void)
-{
-     static int n = 0;
-     if (!n) {
-          unsigned h = std::thread::hardware_concurrency();
-          n = h ? (int)h : 1;
-     }
-     return n;
-}
 #ifdef FFTCHODE_PLANNER_CALIBRATE
 #include <cmath>
 static double fftchode_fcw_[36];
@@ -786,9 +783,15 @@ static double fftchode_fc_spawn(void)
      const char *e = std::getenv("FFTCHODE_PLANSPAWN");
      return e ? std::atof(e) : FFTCHODE_FC_SPAWN;
 }
+static int fftchode_plan_budget(void)
+{
+     const char *e = std::getenv("FFTCHODE_PLANBUDGET");
+     return e ? std::atoi(e) : FFTCHODE_PLAN_BUDGET;
+}
 #else
 static const double *fftchode_fcw(void) { return fftchode_fcw_default; }
 static double fftchode_fc_spawn(void) { return FFTCHODE_FC_SPAWN; }
+static int fftchode_plan_budget(void) { return FFTCHODE_PLAN_BUDGET; }
 #endif
 
 #define FFT_CPP_INNER 1
@@ -1741,6 +1744,7 @@ extern "C" void X(fc_loop)(opcnt *o, const tensor *sz, const tensor *vecsz, int 
 extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT gvl, const opcnt *c);
 extern "C" double X(fc_cost)(const opcnt *o);
 extern "C" void X(fc_thr)(opcnt *o, int nthr);
+extern "C" int X(fc_lanes)(double work, int nthr);
 
 /*
   Definition of rank -infinity.
@@ -2091,6 +2095,7 @@ struct planner_s {
      int nplan;    /* number of plans evaluated */
      double pcost, epcost; /* total pcost of measured/estimated plans */
      int nprob;    /* number of problems evaluated */
+     int fc_nplan0; /* fftchode fast mode: nplan when the top-level plan began */
 };
 
 extern "C" planner *X(mkplanner)(void);
@@ -3833,15 +3838,19 @@ extern "C" double X(fc_cost)(const opcnt *o)
      return a + l[34];
 }
 
-/* o holds the summed operation counts of the nthr children a threaded solver
-   runs in one parallel region: charge their cost divided by the threads that
-   run at once, plus the cost of spawning and joining the region.  FFTW's own
-   counts are left alone, so fftw_flops still reports the total work. */
+/* o holds the summed operation counts of the nthr blocks a threaded solver
+   runs in one parallel region.  The region runs on X(fc_lanes) lanes, so its
+   critical path is ceil(nthr / lanes) blocks: charge that share of the cost,
+   plus the cost of handing the blocks to the other lanes and joining them.
+   FFTW's own counts are left alone, so fftw_flops still reports the total. */
 extern "C" void X(fc_thr)(opcnt *o, int nthr)
 {
-     int p = nthr < ::fftchode_ncpu() ? nthr : ::fftchode_ncpu();
+     int lanes;
      if (nthr <= 1) return;
-     o->fcl[34] -= (1.0 - 1.0 / p) * X(fc_cost)(o) - ::fftchode_fc_spawn();
+     lanes = X(fc_lanes)(o->add + o->mul + 2 * o->fma + o->other, nthr);
+     if (lanes <= 1) return;
+     o->fcl[34] -= (1.0 - (double)((nthr + lanes - 1) / lanes) / nthr) * X(fc_cost)(o)
+	  - ::fftchode_fc_spawn();
 }
 
 extern "C" void X(ops_add)(const opcnt *a, const opcnt *b, opcnt *dst)
@@ -4559,6 +4568,15 @@ static int timeout_p(planner *ego, const problem *p)
      return 0;
 }
 
+/* fftchode fast mode: once a top-level ESTIMATE plan has evaluated more than
+   the plan budget, the rest of its search prunes as stock ESTIMATE does.
+   Highly composite sizes otherwise multiply the unpruned search. */
+static int fc_over_budget(const planner *ego)
+{
+     return ESTIMATEP(ego) && ::fftchode_numerics_mode()
+	  && ego->nplan - ego->fc_nplan0 > ::fftchode_plan_budget();
+}
+
 static plan *search0(planner *ego, const problem *p, unsigned *slvndx, 
 		     const flags_t *flagsp)
 {
@@ -4605,7 +4623,7 @@ static plan *search0(planner *ego, const problem *p, unsigned *slvndx,
                     *slvndx = (unsigned)/*from ptrdiff_t*/(sp - ego->slvdescs);                    
 	       }
 
-	       if (ALLOW_PRUNINGP(ego) && could_prune_now_p) 
+	       if ((ALLOW_PRUNINGP(ego) || fc_over_budget(ego)) && could_prune_now_p) 
 		    break;
 	  }
      });
@@ -4964,6 +4982,7 @@ extern "C" planner *X(mkplanner)(void)
 
      p->adt = &padt;
      p->nplan = p->nprob = 0;
+     p->fc_nplan0 = 0;
      p->pcost = p->epcost = 0.0;
      p->hook = 0;
      p->cost_hook = 0;
@@ -5150,7 +5169,7 @@ extern "C" plan *X(mkplan_shadow)(planner *plnr, problem *prb, const plan *like,
 	  char *a = structure_of(sh), *b = structure_of(like);
 	  int same = !strcmp(a, b);
 	  X(ifree)(a); X(ifree)(b);
-	  if (!same) {
+	  if (!same && !::fftchode_numerics_mode()) {
 	       X(plan_destroy_internal)(sh);
 	       return 0;
 	  }
@@ -12918,6 +12937,35 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	       pln->nb = nb;
 	       pln->bd = X(bufdist)(t->n, nb);
 	       pln->inplace = inplace;
+	  }
+     }
+     if (pln->n && ::fftchode_numerics_mode() && X(shadow_ok)(plnr)) {
+	  flags_t flags = plnr->flags;
+	  int nthr = plnr->nthr;
+	  plan *sh;
+	  plnr->flags.hash_info = 0;
+	  plnr->nthr = 1;
+	  sh = X(mkplan_d)(plnr,
+			  X(mkproblem_dft_d)(
+			       X(mktensor_1d)(pln->n, pln->inplace ? 2 : pln->is, 2),
+			       X(mktensor_0d)(),
+			       p->ri, p->ii, pln->inplace ? p->ri : p->ro,
+			       pln->inplace ? p->ii : p->io));
+	  plnr->flags = flags;
+	  plnr->nthr = nthr;
+	  if (sh) {
+	       INT nblk = pln->vl / pln->nb, rest = pln->vl - nblk * pln->nb;
+	       opcnt *o = &pln->super.super.ops;
+	       X(ops_zero)(o);
+	       o->other = 3.14159;
+	       X(ops_madd2)(nblk * pln->nb, &sh->ops, o);
+	       X(ops_madd2)(rest, &cld->ops, o);
+	       o->other += (pln->inplace ? 4.0 : 2.0) * (double)pln->n * (double)(nblk * pln->nb);
+	       X(fc_mem)(o, 1, pln->nb, pln->ovs, pln->n, pln->os, 2 * sizeof(R), nblk, pln->nb * pln->ovs);
+	       if (pln->inplace)
+		    X(fc_mem)(o, 1, pln->nb, pln->ivs, pln->n, pln->is, 2 * sizeof(R), nblk, pln->nb * pln->ivs);
+	       o->fcl[4] += (double)pln->vl;
+	       X(plan_destroy_internal)(sh);
 	  }
      }
 
@@ -471680,9 +471728,11 @@ extern "C" void X(mapflags)(planner *plnr, unsigned flags)
      map_flags(&flags, &flags, self_flagmap, NELEM(self_flagmap));
 
      /* fast mode: ESTIMATE ranks every applicable plan instead of stopping
-        at the first one marked could_prune_now_p */
-     if ((flags & FFTW_ESTIMATE) && ::fftchode_numerics_mode())
+        at the first one marked could_prune_now_p, within a plan budget */
+     if ((flags & FFTW_ESTIMATE) && ::fftchode_numerics_mode()) {
           flags &= ~FFTW_ALLOW_PRUNING;
+          plnr->fc_nplan0 = plnr->nplan;
+     }
 
      l = u = 0;
      map_flags(&flags, &l, l_flagmap, NELEM(l_flagmap));
@@ -474527,7 +474577,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
 	  pln->super.super.pcost += cldrn[i]->pcost;
      }
-     if (::fftchode_numerics_mode())
+     if (::fftchode_numerics_mode() && X(iabs)(pln->ots) * (INT)sizeof(R) >= 64)
 	  X(fc_thr)(&pln->super.super.ops, nthr);
 
      return &(pln->super.super);
@@ -475392,7 +475442,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
 	  pln->super.super.pcost += cldrn[i]->pcost;
      }
-     if (::fftchode_numerics_mode())
+     if (::fftchode_numerics_mode() && X(iabs)(pln->ots) * (INT)sizeof(R) >= 64)
 	  X(fc_thr)(&pln->super.super.ops, nthr);
 
      return &(pln->super.super);
@@ -475965,6 +476015,16 @@ extern "C" int X(ithreads_init)(void)
      return 0; /* no error */
 }
 
+/* fftchode fast-mode cost model: the lanes X(spawn_loop_work) would run nthr
+   blocks of the given work on, with every spare lane free. */
+extern "C" int X(fc_lanes)(double work, int nthr)
+{
+     int nlanes = nthr;
+     if (work < min_work * nthr)
+	  nlanes = work < 2 * min_work ? 1 : (int)(work / min_work);
+     return nlanes < max_lanes ? nlanes : max_lanes;
+}
+
 extern "C" double X(spawn_work)(plan **plns, int n)
 {
      double w = 0;
@@ -476369,7 +476429,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
 	  pln->super.super.pcost += cldrn[i]->pcost;
      }
-     if (::fftchode_numerics_mode())
+     if (::fftchode_numerics_mode() && X(iabs)(pln->ots) * (INT)sizeof(R) >= 64)
 	  X(fc_thr)(&pln->super.super.ops, nthr);
 
      return &(pln->super.super);

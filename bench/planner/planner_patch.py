@@ -24,25 +24,22 @@ GLOBAL = r'''/* ==== fftchode fast-mode ESTIMATE planner (opt/planner, FFTE-6) =
  * L1/L2/L3/DRAM, 6 child-plan calls in loops, 7-34 codelet arithmetic by
  * register width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1
  * real), 35 extra for codelets of radix > 16.
- * A threaded plan (X(fc_thr)) costs its parallel part divided by the threads
- * that can run at once, min(nthr, hardware threads), plus FFTCHODE_FC_SPAWN
- * cost units per parallel region (1.2e5 units ~ 15 us on the calibration
- * machine, where one unit is ~0.13 ns).
+ * A threaded plan (X(fc_thr)) costs its parallel part divided by the lanes
+ * the thread pool will actually run it on (the CPUs in the process's affinity
+ * mask, fewer when the work is too small to wake a thread), plus
+ * FFTCHODE_FC_SPAWN cost units per parallel region (one unit is ~0.13 ns on
+ * the calibration machine).
+ * The unpruned search evaluates at most FFTCHODE_PLAN_BUDGET plans per
+ * top-level plan; after that it prunes as stock ESTIMATE does.  The budget is
+ * a count, not a time, so plans stay reproducible.
  * Building with -DFFTCHODE_PLANNER_CALIBRATE reads FFTCHODE_PLANW (36
- * comma-separated weights), FFTCHODE_PLANSPAWN (spawn cost) and
- * FFTCHODE_PLANRAND (sigma,seed: random cost perturbation for sampling plans). */
+ * comma-separated weights), FFTCHODE_PLANSPAWN (spawn cost),
+ * FFTCHODE_PLANBUDGET (plan budget) and FFTCHODE_PLANRAND (sigma,seed: random
+ * cost perturbation for sampling plans). */
 #include <thread>
 #define FFTCHODE_FC_SPAWN 1.2e5
+#define FFTCHODE_PLAN_BUDGET 10000
 static const double fftchode_fcw_default[36] = FFTCHODE_FCW_INIT;
-static int fftchode_ncpu(void)
-{
-     static int n = 0;
-     if (!n) {
-          unsigned h = std::thread::hardware_concurrency();
-          n = h ? (int)h : 1;
-     }
-     return n;
-}
 #ifdef FFTCHODE_PLANNER_CALIBRATE
 #include <cmath>
 static double fftchode_fcw_[36];
@@ -75,13 +72,19 @@ static double fftchode_fc_spawn(void)
      const char *e = std::getenv("FFTCHODE_PLANSPAWN");
      return e ? std::atof(e) : FFTCHODE_FC_SPAWN;
 }
+static int fftchode_plan_budget(void)
+{
+     const char *e = std::getenv("FFTCHODE_PLANBUDGET");
+     return e ? std::atoi(e) : FFTCHODE_PLAN_BUDGET;
+}
 #else
 static const double *fftchode_fcw(void) { return fftchode_fcw_default; }
 static double fftchode_fc_spawn(void) { return FFTCHODE_FC_SPAWN; }
+static int fftchode_plan_budget(void) { return FFTCHODE_PLAN_BUDGET; }
 #endif
 
 '''
-WEIGHTS = "{ 1, 1.74, 1.5, 1.81, 4.85, 37.2, 44.1, 1.03, 1, 0.897, 0.844, 1, 0.352, 1.12, 0.961, 0.719, 0.99, 0.742, 0.802, 0.672, 1.3, 1.28, 1.2, 0.899, 0.55, 0.98, 0.25, 1.21, 7.2, 4.77, 0.493, 0.25, 1.21, 1.48, 5.79, 0.141 }"
+WEIGHTS = "{ 1,1.397,1.802,2.308,4.549,0,39.11,0.9886,0,0.9091,1.066,0,0,0.8838,0.9278,0.9154,1.016,0.5812,0.7173,0.155,1.345,1.456,1.145,0.8925,0.5188,0.9154,0,1.36,8.137,9.919,0.9093,0.07543,1.262,8.516,11.2,0.0975 }"
 if len(sys.argv) > 2: WEIGHTS = '{ ' + sys.argv[2] + ' }'
 rep('''#define FFT_CPP_INNER 1
 #ifndef FFT_NO_DOUBLE''', '#define FFTCHODE_FCW_INIT ' + WEIGHTS + '\n' + GLOBAL + '''#define FFT_CPP_INNER 1
@@ -93,11 +96,32 @@ rep('''     map_flags(&flags, &flags, self_flagmap, NELEM(self_flagmap));
      l = u = 0;''', '''     map_flags(&flags, &flags, self_flagmap, NELEM(self_flagmap));
 
      /* fast mode: ESTIMATE ranks every applicable plan instead of stopping
-        at the first one marked could_prune_now_p */
-     if ((flags & FFTW_ESTIMATE) && %s)
+        at the first one marked could_prune_now_p, within a plan budget */
+     if ((flags & FFTW_ESTIMATE) && %s) {
           flags &= ~FFTW_ALLOW_PRUNING;
+          plnr->fc_nplan0 = plnr->nplan;
+     }
 
      l = u = 0;''' % FAST)
+
+# ---------------------------------------------------------------- search budget
+rep('''     int nprob;    /* number of problems evaluated */
+};''', '''     int nprob;    /* number of problems evaluated */
+     int fc_nplan0; /* fftchode fast mode: nplan when the top-level plan began */
+};''')
+rep('''     p->nplan = p->nprob = 0;''', '''     p->nplan = p->nprob = 0;
+     p->fc_nplan0 = 0;''')
+rep('''static plan *search0(planner *ego, const problem *p, unsigned *slvndx, ''', '''/* fftchode fast mode: once a top-level ESTIMATE plan has evaluated more than
+   the plan budget, the rest of its search prunes as stock ESTIMATE does.
+   Highly composite sizes otherwise multiply the unpruned search. */
+static int fc_over_budget(const planner *ego)
+{
+     return ESTIMATEP(ego) && %s
+\t  && ego->nplan - ego->fc_nplan0 > ::fftchode_plan_budget();
+}
+
+static plan *search0(planner *ego, const problem *p, unsigned *slvndx, ''' % FAST)
+rep('''\t       if (ALLOW_PRUNINGP(ego) && could_prune_now_p) ''', '''\t       if ((ALLOW_PRUNINGP(ego) || fc_over_budget(ego)) && could_prune_now_p) ''')
 
 # ---------------------------------------------------------------- opcnt
 rep('''typedef struct {
@@ -125,6 +149,7 @@ extern "C" void X(fc_loop)(opcnt *o, const tensor *sz, const tensor *vecsz, int 
 extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT gvl, const opcnt *c);
 extern "C" double X(fc_cost)(const opcnt *o);
 extern "C" void X(fc_thr)(opcnt *o, int nthr);
+extern "C" int X(fc_lanes)(double work, int nthr);
 ''' + s[j:]
 
 rep('''     dst->add = dst->mul = dst->fma = dst->other = 0;''', '''     int i;
@@ -261,15 +286,19 @@ extern "C" double X(fc_cost)(const opcnt *o)
      return a + l[34];
 }
 
-/* o holds the summed operation counts of the nthr children a threaded solver
-   runs in one parallel region: charge their cost divided by the threads that
-   run at once, plus the cost of spawning and joining the region.  FFTW's own
-   counts are left alone, so fftw_flops still reports the total work. */
+/* o holds the summed operation counts of the nthr blocks a threaded solver
+   runs in one parallel region.  The region runs on X(fc_lanes) lanes, so its
+   critical path is ceil(nthr / lanes) blocks: charge that share of the cost,
+   plus the cost of handing the blocks to the other lanes and joining them.
+   FFTW's own counts are left alone, so fftw_flops still reports the total. */
 extern "C" void X(fc_thr)(opcnt *o, int nthr)
 {
-     int p = nthr < ::fftchode_ncpu() ? nthr : ::fftchode_ncpu();
+     int lanes;
      if (nthr <= 1) return;
-     o->fcl[34] -= (1.0 - 1.0 / p) * X(fc_cost)(o) - ::fftchode_fc_spawn();
+     lanes = X(fc_lanes)(o->add + o->mul + 2 * o->fma + o->other, nthr);
+     if (lanes <= 1) return;
+     o->fcl[34] -= (1.0 - (double)((nthr + lanes - 1) / lanes) / nthr) * X(fc_cost)(o)
+	  - ::fftchode_fc_spawn();
 }''')
 
 # ---------------------------------------------------------------- estimator
@@ -508,6 +537,8 @@ if 'XSIMD_STRING("rdft2-pair")' in s:
      X(fc_mem)(&pln->super.super.ops, 1, 2 * b2, cv, n / 2 + 1, cs, 2 * sizeof(R), npairs / b2, 2 * b2 * cv);''')
 
 # ---------------------------------------------------------------- threaded solvers
+# the fftchode pool runs vrank blocks whose outputs start under a line apart on the caller
+VGUARD = ' && X(iabs)(pln->ots) * (INT)sizeof(R) >= 64' if 'static int max_lanes = 1;' in s else ''
 rep('''     for (i = 0; i < nthr; ++i) {
 \t  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
 \t  pln->super.super.pcost += cldrn[i]->pcost;
@@ -516,9 +547,9 @@ rep('''     for (i = 0; i < nthr; ++i) {
 \t  X(ops_add2)(&cldrn[i]->ops, &pln->super.super.ops);
 \t  pln->super.super.pcost += cldrn[i]->pcost;
      }
-     if (%s)
+     if (%s%s)
 \t  X(fc_thr)(&pln->super.super.ops, nthr);
-''' % FAST, 3)
+''' % (FAST, VGUARD), 3)
 rep('''\t  pln->super.super.could_prune_now_p |= cldws[i]->could_prune_now_p;
      }
      X(ops_add2)(&cld->ops, &pln->super.super.ops);
@@ -528,6 +559,105 @@ rep('''\t  pln->super.super.could_prune_now_p |= cldws[i]->could_prune_now_p;
 \t  X(fc_thr)(&pln->super.super.ops, nthr);
      X(ops_add2)(&cld->ops, &pln->super.super.ops);
 ''' % FAST, 2)
+
+# ---------------------------------------------------------------- fftchode column buffering, if present
+# The shadow (the child replanned for the buffered columns) must have the
+# child's structure only so that baseline mode stays bit-identical.  The fast
+# cost model plans the buffered problem differently from the strided one, so
+# the identical-structure check rejected nearly every shadow in fast mode and
+# column passes ran unbuffered.
+if 'extern "C" plan *X(mkplan_shadow)' in s:
+    rep('''\t  int same = !strcmp(a, b);
+\t  X(ifree)(a); X(ifree)(b);
+\t  if (!same) {''', '''\t  int same = !strcmp(a, b);
+\t  X(ifree)(a); X(ifree)(b);
+\t  if (!same && !%s) {''' % FAST)
+    # price a buffered column loop as what it runs: the shadow plan on nb
+    # adjacent columns at a time plus the copy of their lines back
+    rep('''\t       pln->bd = X(bufdist)(t->n, nb);
+\t       pln->inplace = inplace;
+\t  }
+     }
+
+     return &(pln->super.super);''', '''\t       pln->bd = X(bufdist)(t->n, nb);
+\t       pln->inplace = inplace;
+\t  }
+     }
+     if (pln->n && %s && X(shadow_ok)(plnr)) {
+\t  flags_t flags = plnr->flags;
+\t  int nthr = plnr->nthr;
+\t  plan *sh;
+\t  plnr->flags.hash_info = 0;
+\t  plnr->nthr = 1;
+\t  sh = X(mkplan_d)(plnr,
+\t\t\t  X(mkproblem_dft_d)(
+\t\t\t       X(mktensor_1d)(pln->n, pln->inplace ? 2 : pln->is, 2),
+\t\t\t       X(mktensor_0d)(),
+\t\t\t       p->ri, p->ii, pln->inplace ? p->ri : p->ro,
+\t\t\t       pln->inplace ? p->ii : p->io));
+\t  plnr->flags = flags;
+\t  plnr->nthr = nthr;
+\t  if (sh) {
+\t       INT nblk = pln->vl / pln->nb, rest = pln->vl - nblk * pln->nb;
+\t       opcnt *o = &pln->super.super.ops;
+\t       X(ops_zero)(o);
+\t       o->other = 3.14159;
+\t       X(ops_madd2)(nblk * pln->nb, &sh->ops, o);
+\t       X(ops_madd2)(rest, &cld->ops, o);
+\t       o->other += (pln->inplace ? 4.0 : 2.0) * (double)pln->n * (double)(nblk * pln->nb);
+\t       X(fc_mem)(o, 1, pln->nb, pln->ovs, pln->n, pln->os, 2 * sizeof(R), nblk, pln->nb * pln->ovs);
+\t       if (pln->inplace)
+\t\t    X(fc_mem)(o, 1, pln->nb, pln->ivs, pln->n, pln->is, 2 * sizeof(R), nblk, pln->nb * pln->ivs);
+\t       o->fcl[4] += (double)pln->vl;
+\t       X(plan_destroy_internal)(sh);
+\t  }
+     }
+
+     return &(pln->super.super);''' % FAST)
+
+# ---------------------------------------------------------------- lanes of a parallel region
+if 'static int max_lanes = 1;' in s:
+    rep('''extern "C" double X(spawn_work)(plan **plns, int n)
+{''', '''/* fftchode fast-mode cost model: the lanes X(spawn_loop_work) would run nthr
+   blocks of the given work on, with every spare lane free. */
+extern "C" int X(fc_lanes)(double work, int nthr)
+{
+     int nlanes = nthr;
+     if (work < min_work * nthr)
+\t  nlanes = work < 2 * min_work ? 1 : (int)(work / min_work);
+     return nlanes < max_lanes ? nlanes : max_lanes;
+}
+
+extern "C" double X(spawn_work)(plan **plns, int n)
+{''')
+else:
+    rep('''extern "C" void X(fc_thr)(opcnt *o, int nthr)
+{''', '''extern "C" int X(fc_lanes)(double work, int nthr)
+{
+     static int n = 0;
+     (void)work;
+     if (!n) {
+#if defined(__linux__)
+\t  cpu_set_t set;
+\t  if (sched_getaffinity(0, sizeof(set), &set) == 0)
+\t       n = CPU_COUNT(&set);
+#endif
+\t  if (n <= 0)
+\t       n = (int)std::thread::hardware_concurrency();
+\t  if (n <= 0)
+\t       n = 1;
+     }
+     return nthr < n ? nthr : n;
+}
+
+extern "C" void X(fc_thr)(opcnt *o, int nthr)
+{''')
+    rep('''#include <thread>
+#define FFTCHODE_FC_SPAWN''', '''#include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#endif
+#define FFTCHODE_FC_SPAWN''')
 
 open(p, 'w').write(s)
 print('planner patch applied to', p)
