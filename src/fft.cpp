@@ -4757,7 +4757,8 @@ extern "C" int X(shadow_ok)(const planner *plnr)
 }
 
 /* lines of a 32 KiB 8-way L1 (64-byte lines) that a column with this byte
-   stride can occupy: power-of-two strides map to few sets */
+   stride can occupy: power-of-two strides map to few sets.  Column
+   buffering is used only below 512, i.e. when the stride aliases. */
 extern "C" INT X(colbuf_l1_lines)(INT s)
 {
      INT a = 4096, b = s, t;
@@ -12549,6 +12550,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	      && pln->vl >= 2 * nb
 	      && 2 * nb * X(bufdist)(t->n, nb) * (INT)sizeof(R) <= COLBUF_MAXBUF
 	      && t->n * t->is * (INT)sizeof(R) >= FFTCHODE_COLBUF_MIN
+	      && X(colbuf_l1_lines)(t->os * (INT)sizeof(R)) < 512
 	      && t->n > X(colbuf_l1_lines)(t->os * (INT)sizeof(R))) {
 	       pln->n = t->n;
 	       pln->is = t->is;
@@ -64711,8 +64713,10 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	      && nb * bd * (INT)sizeof(R) <= COLBUF_MAXBUF
 	      && n * rstride * (INT)sizeof(R) >= FFTCHODE_COLBUF_MIN
 	      && (p->kind == R2HC
-		  ? n / 2 + 1 > X(colbuf_l1_lines)(cs * (INT)sizeof(R))
-		  : n > X(colbuf_l1_lines)(rstride * (INT)sizeof(R)))) {
+		  ? (X(colbuf_l1_lines)(cs * (INT)sizeof(R)) < 512
+		     && n / 2 + 1 > X(colbuf_l1_lines)(cs * (INT)sizeof(R)))
+		  : (X(colbuf_l1_lines)(rstride * (INT)sizeof(R)) < 512
+		     && n > X(colbuf_l1_lines)(rstride * (INT)sizeof(R))))) {
 	       pln->n = n;
 	       pln->rstride = rstride;
 	       pln->cs = cs;
