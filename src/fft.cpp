@@ -189273,7 +189273,13 @@ extern "C" void X(destroy_plan)(X(plan) p)
 
 extern "C" int X(alignment_of)(R *p)
 {
+#if HAVE_SIMD
+     /* fftchode: the real alignment in both modes; a plan made in fast mode
+        may be executed on new arrays after a switch to baseline */
+     return (int)(((uintptr_t) p) % 16);
+#else
      return X(ialignment_of(p));
+#endif
 }
 }
 
@@ -194839,6 +194845,8 @@ extern "C" void X(cleanup)(void)
                X(planner_destroy)(plnrs[m]);
                plnrs[m] = 0;
           }
+     /* fftchode: as upstream, planners created after cleanup get no threads_conf */
+     X(fftchode_threads_conf) = 0;
 }
 
 extern "C" void X(set_timelimit)(double tlim) 
