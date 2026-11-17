@@ -12,7 +12,11 @@
 // scale = how 1/N is applied after a backward transform: mul (x * (1/N)), div (x / N)
 // Writes the result (interleaved complex, or real when every imaginary part is zero, as MATLAB
 // does) to out.bin and prints "<id-free> <isreal> <shape...>" on stdout.
-#include "fftw3.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
+#include <fftw3.h>
+#endif
 #include <complex>
 #include <cstdint>
 #include <cstdio>

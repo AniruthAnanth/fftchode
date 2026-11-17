@@ -1,5 +1,5 @@
 // Planner calibration helper for the fast-mode ESTIMATE cost model (bench/planner/calibrate.sh).
-// Link against fft.cpp built with -DFFTCHODE_PLANNER_CALIBRATE and run with FFTCHODE_NUMERICS=fast.
+// Link against fftchode.cpp built with -DFFTCHODE_PLANNER_CALIBRATE and run with FFTCHODE_NUMERICS=fast.
 //   retime --suite S --collect OUT [--flags estimate|measure|patient]
 //          plan every case and append its wisdom to OUT
 //          (FFTCHODE_PLANRAND=sigma,seed perturbs the estimated costs to sample other plans)
@@ -8,7 +8,11 @@
 //          interleaved over R rounds; per plan it prints "name ... iters median ...",
 //          "PLAN name <plan>" and "FEAT name <cost-model features>"
 // The case format and the timing/fill code follow bench/suite/fftsuite.cpp.
-#include "fftw3.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
+#include <fftw3.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

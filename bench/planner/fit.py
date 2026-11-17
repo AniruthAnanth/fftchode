@@ -6,7 +6,7 @@ FEAT lines (pass another retime output when the feature definition changed after
 Env: NEAR=k weights samples by exp(-k*(t/tmin-1)) toward near-optimal plans (calibration used 1);
 LAM=x ridge-pulls the width x family weights toward the arithmetic weight; PREC=d|s fits one precision.
 Prints in-sample and 5-fold CV regret (geomean of t(chosen)/t(best) over the sampled plans) and
-W=..., the 36 weights for FFTCHODE_PLANW or for kFastCostWeights in src/fft.cpp."""
+W=..., the 36 weights for FFTCHODE_PLANW or for kFastCostWeights in src/fftchode.cpp."""
 import sys, os, math, random
 import numpy as np
 from scipy.optimize import nnls

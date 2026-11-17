@@ -22,12 +22,12 @@ echo "pocketfft:    $POCKETFFT_URL branch $POCKETFFT_BRANCH @ $POCKETFFT_COMMIT"
 echo "kissfft:      $KISSFFT_URL @ $KISSFFT_COMMIT"
 echo "FFTW:         $FFTW_VERSION ($FFTW_URL, sha256 $FFTW_SHA256)"
 echo "FFTE:         $FFTE_VERSION ($FFTE_URL, sha256 $FFTE_SHA256)"
-echo "fft.cpp:      $(git -C "$HERE/.." rev-parse HEAD) sha256(src/fft.cpp)=$(sha256sum "$HERE/../src/fft.cpp" | cut -d' ' -f1)"
+echo "fftchode:      $(git -C "$HERE/.." rev-parse HEAD) sha256(src/fftchode.cpp)=$(sha256sum "$HERE/../src/fftchode.cpp" | cut -d' ' -f1)"
 for fl in scalar simd; do for p in d s; do
   c=$B/fftw-$fl-$p/build/config.status
   [ -e "$c" ] && echo "FFTW $fl-$p configure: $(grep -m1 '^ac_cs_config=' "$c" | sed "s/^ac_cs_config=//")"
 done; done
-for lib in fftcpp fftw-scalar fftw-simd pocketfft kissfft ffte; do
+for lib in fftchode fftw-scalar fftw-simd pocketfft kissfft ffte; do
   for p in d s; do [ -x "$B/bin/$lib-$p" ] && "$B/bin/$lib-$p" --lib $lib --mode info | sed 's/^/benchee:      /'; done
 done
 exit 0

@@ -1,6 +1,6 @@
 // Frozen-suite FFT benchmark (FFTE-6). Reads a case list and, for each case, plans with
 // FFTW_ESTIMATE through the FFTW3 API and measures plan time and execution time separately.
-// Links against any FFTW3-API object: this repo's fft.o (any revision) or upstream libfftw3[f].
+// Links against any FFTW3-API object: this repo's fftchode.o (any revision) or upstream libfftw3[f].
 //
 //   fftsuite --suite FILE --threads N [--mode time|mem|hash|err] [--batches K] [--tmin S] [--only NAME]
 //            [--plan estimate|measure|patient]   (default estimate; MATLAB's mode)
@@ -14,7 +14,11 @@
 // time: name threads plan_s iters t_1..t_K   (seconds per transform)
 // mem : name threads heap_live_after_plan heap_peak_plan_exec (bytes above the I/O buffers)
 // hash: name threads fnv64(output)   err (needs -DFFTSUITE_REF and libfftw3l): name rel_rms rel_max
-#include "fftw3.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
+#include <fftchode.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

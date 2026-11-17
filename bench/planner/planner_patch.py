@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Apply the opt/planner fast-mode ESTIMATE cost model to an amalgamated fft.cpp
+"""Apply the opt/planner fast-mode ESTIMATE cost model to an amalgamated fftchode.cpp
 (baseline-v0 or the opt/simd regeneration).
-Usage: planner_patch.py fft.cpp ["w0, ..., w35"]   (weights default to the shipped calibration)
+Usage: planner_patch.py fftchode.cpp ["w0, ..., w35"]   (weights default to the shipped calibration)
 COLPACK_ESTIMATE=1 also lets fast ESTIMATE pick dft-colpack (off: it lost 0.4-0.7x on 2-D/3-D cases)."""
 import sys, os
 p = sys.argv[1]; s = open(p).read()

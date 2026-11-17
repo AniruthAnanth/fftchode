@@ -3,7 +3,7 @@
 LB=$DL/benchfft/libbench
 FFTW_INC_PP=$REPO/src
 CFLAGS_B="$OPT_C -I$HERE/src -I$LB"
-LIBS_ALL="fftcpp fftw-scalar fftw-simd pocketfft kissfft ffte"
+LIBS_ALL="fftchode fftw-scalar fftw-simd pocketfft kissfft ffte"
 MEMWRAP="-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=posix_memalign,--wrap=aligned_alloc,--wrap=memalign"
 LIBBENCH_EXCLUDE="main.c bench-main.c speed.c report.c timer.c info.c can-do.c useropt.c"
 
@@ -51,7 +51,7 @@ compile_benchee() {
   local lib=$1 prec=$2 flag="" o=$B/obj/bn-$1-$2.o
   [ "$prec" = s ] && flag="-DBENCHFFT_SINGLE"
   case $lib in
-    fftcpp)       $CC $CFLAGS_B $flag -I"$REPO/src" -c "$HERE/benchees/fftw3.c" -o "$o";;
+    fftchode)       $CC $CFLAGS_B $flag -I"$REPO/src" -c "$HERE/benchees/fftw3.c" -o "$o";;
     fftw-scalar)  $CC $CFLAGS_B $flag -I"$B/fftw-scalar-$prec/inst/include" -c "$HERE/benchees/fftw3.c" -o "$o";;
     fftw-simd)    $CC $CFLAGS_B $flag -I"$B/fftw-simd-$prec/inst/include" -c "$HERE/benchees/fftw3.c" -o "$o";;
     pocketfft)    $CXX -std=c++17 $OPT_C $flag -DPOCKETFFT_CACHE_SIZE=16 -I"$HERE/src" -I"$LB" -I"$DL/pocketfft" -pthread -c "$HERE/benchees/pocketfft.cc" -o "$o";;
@@ -69,7 +69,7 @@ link_bin() {
   ld=$CC
   if [ "$prec" = s ]; then sfx=f; fi
   case $lib in
-    fftcpp)       libs="$REPO/build/fft.o -lstdc++ -lm -pthread"; ld=$CXX;;
+    fftchode)       libs="$REPO/build/fftchode.o -lstdc++ -lm -pthread"; ld=$CXX;;
     fftw-scalar)  libs="$B/fftw-scalar-$prec/inst/lib/libfftw3$sfx.a -lm -pthread";;
     fftw-simd)    libs="$B/fftw-simd-$prec/inst/lib/libfftw3$sfx.a -lm -pthread";;
     pocketfft)    libs="-lm -pthread"; ld=$CXX;;

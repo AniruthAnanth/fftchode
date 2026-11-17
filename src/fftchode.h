@@ -519,4 +519,16 @@ FFTW_DEFINE_API(FFTW_MANGLE_QUAD, __float128, fftwq_complex)
 }  /* extern "C" */
 #endif /* __cplusplus */
 
+/* fftchode: numerics mode. 0 = baseline (bit-identical to FFTW 3.3.10 scalar, the default),
+   1 = fast (SIMD codelets and the fast ESTIMATE planner). FFTCHODE_NUMERICS=baseline|fast
+   in the environment has the same effect when this is never called. Set it before planning. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void fftchode_set_numerics(int mode);
+int fftchode_numerics_mode(void);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* FFTW3_H */

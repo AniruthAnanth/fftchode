@@ -4,7 +4,11 @@
 // SIMD codelets and the paired real-column solver (odd/even n, odd/even column counts,
 // strided, batched, multi-dimensional, r2c and c2r).
 //   fast_check [--verbose]     exit status 0 = all within tolerance
-#include "fftw3.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
+#include <fftw3.h>
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

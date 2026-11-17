@@ -1,15 +1,15 @@
 /*
- * fft.cpp -- FFTW 3.3.10 (scalar and SIMD codelets, double and single
+ * fftchode.cpp -- FFTW 3.3.10 (scalar and SIMD codelets, double and single
  * precision, POSIX threads) as one C++ translation unit.
  *
  * This file is a mechanical amalgamation of the FFTW 3.3.10 source
  * distribution.  The algorithms, code and generated codelets are FFTW's;
  * every original file appears below with its copyright notice intact.
  * The public API is FFTW's own (fftw3.h, embedded below and shipped
- * unmodified as fftw3.h).  The file includes itself once per precision,
- * so it must keep the name fft.cpp.
+ * as src/fftchode.h).  The file includes itself once per precision,
+ * so it must keep the name fftchode.cpp.
  *
- * Build:  c++ -O2 -ffp-contract=off -pthread -c fft.cpp   (no -m flags needed)
+ * Build:  c++ -O2 -ffp-contract=off -pthread -c fftchode.cpp   (no -m flags needed)
  *
  * Numerics: fftchode_set_numerics(0|1) or FFTCHODE_NUMERICS=baseline|fast
  * (read once, at first use).  Baseline (default) uses the scalar codelets
@@ -797,13 +797,13 @@ static int fftchode_plan_budget(void) { return FFTCHODE_PLAN_BUDGET; }
 #define FFT_CPP_INNER 1
 #ifndef FFT_NO_DOUBLE
 #define FFT_PREC_NS fftw_amalgamation_double
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_PREC_NS
 #endif
 #ifndef FFT_NO_SINGLE
 #define FFTW_SINGLE 1
 #define FFT_PREC_NS fftw_amalgamation_single
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_PREC_NS
 #undef FFTW_SINGLE
 #endif
@@ -909,7 +909,7 @@ namespace f001_kernel_align {
 /* #undef FC_DUMMY_MAIN_EQ_F77 */
 
 /* C compiler name and flags */
-#define FFTW_CC "fft.cpp: c++ -O2 -ffp-contract=off"
+#define FFTW_CC "fftchode.cpp: c++ -O2 -ffp-contract=off"
 
 /* Define to enable extra FFTW debugging code. */
 /* #undef FFTW_DEBUG */
@@ -1310,7 +1310,7 @@ namespace f001_kernel_align {
    such a type exists and the standard includes do not define it. */
 /* #undef uint64_t */
 /* fftchode: FFTW's SIMD extensions, compiled into every x86-64 / aarch64 build without -m
-   flags (target pragmas) and used only in fast numerics mode; see FFTCHODE_SIMD_* in fft.cpp */
+   flags (target pragmas) and used only in fast numerics mode; see FFTCHODE_SIMD_* in fftchode.cpp */
 #if defined(FFTCHODE_SIMD_X86)
 #define HAVE_SSE2 1
 #define HAVE_AVX 1
@@ -12702,6 +12702,7 @@ typedef struct {
 	in cache.  Identical structure means identical arithmetic. */
      INT n, is, os, nb, bd;
      int inplace;
+     R *ri0;
      plan *shadow;
 } P;
 
@@ -12767,7 +12768,9 @@ static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
 
      if (!X(shadow_ok)(plnr))
 	  return 0;
-     in = (R *) MALLOC(sizeof(R) * 2 * (size_t)ego->n * (size_t)ego->is, BUFFERS);
+     /* the strided side is the plan's own array (never touched under ESTIMATE);
+	only the contiguous buffer side is allocated */
+     in = ego->inplace ? (R *) MALLOC(sizeof(R) * 2 * ego->n, BUFFERS) : ego->ri0;
      out = ego->inplace ? in : (R *) MALLOC(sizeof(R) * 2 * ego->n, BUFFERS);
      sh = X(mkplan_shadow)(plnr,
 			   X(mkproblem_dft_d)(
@@ -12775,8 +12778,7 @@ static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
 				X(mktensor_0d)(),
 				in, in + 1, out, out + 1),
 			   ego->cld, wakefulness);
-     if (!ego->inplace) X(ifree)(out);
-     X(ifree)(in);
+     X(ifree)(out);
      return sh;
 }
 
@@ -12937,6 +12939,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	       pln->nb = nb;
 	       pln->bd = X(bufdist)(t->n, nb);
 	       pln->inplace = inplace;
+	       pln->ri0 = UNTAINT(p->ri);
 	  }
      }
      if (pln->n && ::fftchode_numerics_mode() && X(shadow_ok)(plnr)) {
@@ -141771,6 +141774,7 @@ typedef struct {
 	plan of identical structure */
      INT n, rstride, cs, nb, bd;
      rdft_kind kind;
+     R *r00;
      plan *shadow;
 } P;
 
@@ -141829,14 +141833,12 @@ static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
 static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
 {
      planner *plnr = X(the_planner)();
-     size_t insz;
      R *in, *out;
      plan *sh;
 
      if (!X(shadow_ok)(plnr))
 	  return 0;
-     insz = sizeof(R) * (size_t)ego->n * (size_t)(ego->rstride > ego->cs ? ego->rstride : ego->cs);
-     in = (R *) MALLOC(insz, BUFFERS);
+     in = ego->r00;  /* the strided real side: the plan's own array, untouched under ESTIMATE */
      out = (R *) MALLOC(sizeof(R) * (ego->n + 2), BUFFERS);
      if (ego->kind == R2HC)
 	  sh = X(mkplan_shadow)(plnr,
@@ -141853,7 +141855,6 @@ static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
 				     out, out + 1, in, in + 1, HC2R),
 				ego->cld, wakefulness);
      X(ifree)(out);
-     X(ifree)(in);
      return sh;
 }
 
@@ -142026,6 +142027,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	       pln->nb = nb;
 	       pln->bd = bd;
 	       pln->kind = p->kind;
+	       pln->r00 = UNTAINT(p->r0);
 	  }
      }
 
@@ -477519,32 +477521,32 @@ extern "C" void X(fftchode_rdft2_embed_register)(planner *p)
 
 #if HAVE_SSE2
 #define FFT_CPP_SIMD 1 /* sse2 */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 #if HAVE_AVX
 #define FFT_CPP_SIMD 2 /* avx */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 #if HAVE_AVX2
 #define FFT_CPP_SIMD 3 /* avx2 */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 #if HAVE_AVX2
 #define FFT_CPP_SIMD 4 /* avx2-128 */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 #if HAVE_AVX512
 #define FFT_CPP_SIMD 5 /* avx512 */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 #if HAVE_NEON
 #define FFT_CPP_SIMD 6 /* neon */
-#include "fft.cpp"
+#include "fftchode.cpp"
 #undef FFT_CPP_SIMD
 #endif
 
