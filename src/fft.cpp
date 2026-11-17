@@ -3758,7 +3758,9 @@ static unsigned addmod(unsigned a, unsigned b, unsigned p)
 */
 static void sgrow(planner *ego)
 {
-     unsigned osiz = ego->slvdescsiz, nsiz = 1 + osiz + osiz / 4;
+     /* fftchode: start at the default configuration's solver count (805)
+        so that registration does not peak at old+new array sizes */
+     unsigned osiz = ego->slvdescsiz, nsiz = osiz ? 1 + osiz + osiz / 4 : 832;
      slvdesc *ntab = (slvdesc *)MALLOC(nsiz * sizeof(slvdesc), SLVDESCS);
      slvdesc *otab = ego->slvdescs;
      unsigned i;
