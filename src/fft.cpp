@@ -609,6 +609,13 @@ extern "C" int fftchode_numerics_mode(void)
 #define FFTCHODE_SIMD_NEON 1
 #include <arm_neon.h>
 #endif
+/* fast mode adds fftchode's own solvers (rdft2-pair, rdft2-embed, dft-colpack) to FFTW's; FFTCHODE_FAST_SOLVERS=upstream
+   leaves them out, so that fast mode equals upstream FFTW with the same SIMD extensions */
+static int fftchode_extra_solvers(void)
+{
+     const char *e = std::getenv("FFTCHODE_FAST_SOLVERS");
+     return fftchode_numerics_mode() == 1 && !(e && !std::strcmp(e, "upstream"));
+}
 #if defined(FFTCHODE_SIMD_X86) || defined(FFTCHODE_SIMD_NEON)
 /* FFTCHODE_SIMD=<comma-separated list> limits the extensions fast mode registers */
 static int fftchode_simd_allowed(const char *isa)
@@ -57883,6 +57890,13 @@ static const solvtab s =
      SOLVTAB_END
 };
 
+extern "C" void X(fftchode_rdft2_embed_register)(planner *);
+static const solvtab fftchode_s =
+{
+     SOLVTAB(X(fftchode_rdft2_embed_register)),
+     SOLVTAB_END
+};
+
 extern "C" void X(rdft_conf_standard)(planner *p)
 {
      X(solvtab_exec)(s, p);
@@ -57936,6 +57950,8 @@ extern "C" void X(rdft_conf_standard)(planner *p)
 #if HAVE_GENERIC_SIMD256
      X(solvtab_exec)(X(solvtab_rdft_generic_simd256), p);
 #endif
+     if (fftchode_extra_solvers())
+	  X(solvtab_exec)(fftchode_s, p);
 }
 }
 
@@ -189273,7 +189289,11 @@ extern "C" void X(destroy_plan)(X(plan) p)
 
 extern "C" int X(alignment_of)(R *p)
 {
+#if HAVE_SIMD
+     return (int)(((uintptr_t) p) % 16);
+#else
      return X(ialignment_of(p));
+#endif
 }
 }
 
@@ -194839,6 +194859,8 @@ extern "C" void X(cleanup)(void)
                X(planner_destroy)(plnrs[m]);
                plnrs[m] = 0;
           }
+     /* as upstream, planners created after cleanup get no threads_conf */
+     X(fftchode_threads_conf) = 0;
 }
 
 extern "C" void X(set_timelimit)(double tlim) 
@@ -198206,6 +198228,146 @@ namespace f431_simd_support_neon {
 
 #endif
 }
+
+/* ==== fftchode/rdft2-embed.c ==== */
+namespace f432_fftchode_rdft2_embed {
+/*
+ * fftchode (FFTE-6, opt/simd): a single real-data transform of odd size n
+ * (where FFTW has no half-length complex path) computed as a complex DFT of
+ * the real data with zero imaginary part, so that the complex (SIMD) codelets
+ * do the work.  Fast mode only.
+ *   R2HC: Z = DFT(x + 0i), X[f] = Z[f] for f <= n/2
+ *   HC2R: Z = Hermitian extension of X (imaginary part of X[0] ignored),
+ *         x = Re IDFT(Z)
+ */
+
+
+typedef struct {
+     solver super;
+} S;
+
+typedef struct {
+     plan_rdft2 super;
+     plan *cld;
+     INT n, rs, cs;
+} P;
+
+static void apply_r2hc(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
+{
+     const P *ego = (const P *) ego_;
+     INT f, n = ego->n, rs = ego->rs, cs = ego->cs;
+     R *B = (R *) MALLOC(sizeof(R) * 4 * n, BUFFERS), *C = B + 2 * n;
+     plan_dft *cld = (plan_dft *) ego->cld;
+     UNUSED(r1);
+     for (f = 0; f < n; ++f) {
+	  B[2 * f] = r0[f * rs];
+	  B[2 * f + 1] = K(0.0);
+     }
+     cld->apply((plan *) cld, B, B + 1, C, C + 1);
+     for (f = 0; f + f <= n; ++f) {
+	  cr[f * cs] = C[2 * f];
+	  ci[f * cs] = f ? C[2 * f + 1] : K(0.0);
+     }
+     X(ifree)(B);
+}
+
+static void apply_hc2r(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
+{
+     const P *ego = (const P *) ego_;
+     INT f, n = ego->n, rs = ego->rs, cs = ego->cs;
+     R *B = (R *) MALLOC(sizeof(R) * 4 * n, BUFFERS), *C = B + 2 * n;
+     plan_dft *cld = (plan_dft *) ego->cld;
+     UNUSED(r1);
+     B[0] = cr[0];
+     B[1] = K(0.0);
+     for (f = 1; f + f <= n; ++f) {
+	  B[2 * f] = B[2 * (n - f)] = cr[f * cs];
+	  B[2 * f + 1] = ci[f * cs];
+	  B[2 * (n - f) + 1] = -ci[f * cs];
+     }
+     cld->apply((plan *) cld, B + 1, B, C + 1, C);
+     for (f = 0; f < n; ++f)
+	  r0[f * rs] = C[2 * f];
+     X(ifree)(B);
+}
+
+static void awake(plan *ego_, enum wakefulness wakefulness)
+{
+     P *ego = (P *) ego_;
+     X(plan_awake)(ego->cld, wakefulness);
+}
+
+static void destroy(plan *ego_)
+{
+     P *ego = (P *) ego_;
+     X(plan_destroy_internal)(ego->cld);
+}
+
+static void print(const plan *ego_, printer *p)
+{
+     const P *ego = (const P *) ego_;
+     p->print(p, "(rdft2-embed-%s-%D%(%p%))",
+	      ego->super.apply == apply_r2hc ? "r2hc" : "hc2r", ego->n, ego->cld);
+}
+
+static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
+{
+     const problem_rdft2 *p = (const problem_rdft2 *) p_;
+     P *pln;
+     plan *cld;
+     R *B;
+     INT n, rs2, cs;
+     static const plan_adt padt = {
+	  X(rdft2_solve), awake, print, destroy
+     };
+     UNUSED(ego_);
+
+     if (!(1
+	   && !NO_BUFFERINGP(plnr)
+	   && (p->kind == R2HC || p->kind == HC2R)
+	   && p->sz->rnk == 1
+	   && (p->vecsz->rnk == 0 || (p->vecsz->rnk == 1 && p->vecsz->dims[0].n == 1))
+	   && (p->sz->dims[0].n % 2) == 1
+	   && p->sz->dims[0].n >= 3
+	   && p->r0 != p->cr))
+	  return (plan *) 0;
+     X(rdft2_strides)(p->kind, p->sz->dims, &rs2, &cs);
+     if (rs2 != 2 * (p->r1 - p->r0))
+	  return (plan *) 0;
+     n = p->sz->dims[0].n;
+
+     B = (R *) MALLOC(sizeof(R) * 4 * n, BUFFERS);
+     cld = X(mkplan_d)(plnr,
+		       X(mkproblem_dft_d)(X(mktensor_1d)(n, 2, 2), X(mktensor_1d)(1, 0, 0),
+					  p->kind == R2HC ? B : B + 1, p->kind == R2HC ? B + 1 : B,
+					  p->kind == R2HC ? B + 2 * n : B + 2 * n + 1,
+					  p->kind == R2HC ? B + 2 * n + 1 : B + 2 * n));
+     X(ifree)(B);
+     if (!cld)
+	  return (plan *) 0;
+
+     pln = MKPLAN_RDFT2(P, &padt, p->kind == R2HC ? apply_r2hc : apply_hc2r);
+     pln->cld = cld;
+     pln->n = n;
+     pln->rs = rs2 / 2;
+     pln->cs = cs;
+     X(ops_cpy)(&cld->ops, &pln->super.super.ops);
+     pln->super.super.ops.other += 4 * n;
+     return &(pln->super.super);
+}
+
+static solver *mksolver(void)
+{
+     static const solver_adt sadt = { PROBLEM_RDFT2, mkplan, 0 };
+     S *slv = MKSOLVER(S, &sadt);
+     return &(slv->super);
+}
+
+extern "C" void X(fftchode_rdft2_embed_register)(planner *p)
+{
+     REGISTER_SOLVER(p, mksolver());
+}
+}
 }
 
 #if HAVE_SSE2
@@ -198290,6 +198452,7 @@ namespace f431_simd_support_neon {
 #undef F77_FUNC
 #undef F77_FUNC_
 #undef F77x
+#undef FFTCHODE_COLPACK_BUF_BYTES
 #undef FFTCHODE_PAIR_BUF_BYTES
 #undef FFTW_2R_IS_DOUBLE
 #undef FFTW_CC
@@ -200895,7 +201058,7 @@ static inline V BYTWJ2(const R *t, V sr)
 /* ==== dft/simd/common/codlist.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f432_dft_simd_common_codlist {
+namespace f433_dft_simd_common_codlist {
 
 extern "C" void XSIMD(codelet_n1fv_2)(planner *);
 extern "C" void XSIMD(codelet_n1fv_3)(planner *);
@@ -201069,6 +201232,8 @@ extern "C" void XSIMD(codelet_q1bv_5)(planner *);
 extern "C" void XSIMD(codelet_q1bv_8)(planner *);
 
 
+extern "C" void XSIMD(fftchode_dft_colpack_register)(planner *);
+
 extern "C" const solvtab XSIMD(solvtab_dft);
 extern "C" const solvtab XSIMD(solvtab_dft) = {
    SOLVTAB(XSIMD(codelet_n1fv_2)),
@@ -201241,6 +201406,7 @@ extern "C" const solvtab XSIMD(solvtab_dft) = {
    SOLVTAB(XSIMD(codelet_q1bv_4)),
    SOLVTAB(XSIMD(codelet_q1bv_5)),
    SOLVTAB(XSIMD(codelet_q1bv_8)),
+   SOLVTAB(XSIMD(fftchode_dft_colpack_register)),
    SOLVTAB_END
 };
 }
@@ -201250,7 +201416,7 @@ extern "C" const solvtab XSIMD(solvtab_dft) = {
 /* ==== dft/simd/common/genus.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f433_dft_simd_common_genus {
+namespace f434_dft_simd_common_genus {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -201588,7 +201754,7 @@ extern "C" { EXTERN_CONST(ct_genus,  XSIMD(dft_tssimd_genus)) = { ts_okp, 2 * VL
 /* ==== dft/simd/common/n1bv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f434_dft_simd_common_n1bv_10 {
+namespace f435_dft_simd_common_n1bv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -201872,7 +202038,7 @@ extern "C" void XSIMD(codelet_n1bv_10) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_11.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f435_dft_simd_common_n1bv_11 {
+namespace f436_dft_simd_common_n1bv_11 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -202194,7 +202360,7 @@ extern "C" void XSIMD(codelet_n1bv_11) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f436_dft_simd_common_n1bv_12 {
+namespace f437_dft_simd_common_n1bv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -202502,7 +202668,7 @@ extern "C" void XSIMD(codelet_n1bv_12) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_128.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f437_dft_simd_common_n1bv_128 {
+namespace f438_dft_simd_common_n1bv_128 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -206208,7 +206374,7 @@ extern "C" void XSIMD(codelet_n1bv_128) (planner *p) { X(kdft_register) (p, n1bv
 /* ==== dft/simd/common/n1bv_13.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f438_dft_simd_common_n1bv_13 {
+namespace f439_dft_simd_common_n1bv_13 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -206671,7 +206837,7 @@ extern "C" void XSIMD(codelet_n1bv_13) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_14.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f439_dft_simd_common_n1bv_14 {
+namespace f440_dft_simd_common_n1bv_14 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -207034,7 +207200,7 @@ extern "C" void XSIMD(codelet_n1bv_14) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_15.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f440_dft_simd_common_n1bv_15 {
+namespace f441_dft_simd_common_n1bv_15 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -207432,7 +207598,7 @@ extern "C" void XSIMD(codelet_n1bv_15) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f441_dft_simd_common_n1bv_16 {
+namespace f442_dft_simd_common_n1bv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -207836,7 +208002,7 @@ extern "C" void XSIMD(codelet_n1bv_16) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f442_dft_simd_common_n1bv_2 {
+namespace f443_dft_simd_common_n1bv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -207986,7 +208152,7 @@ extern "C" void XSIMD(codelet_n1bv_2) (planner *p) { X(kdft_register) (p, n1bv_2
 /* ==== dft/simd/common/n1bv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f443_dft_simd_common_n1bv_20 {
+namespace f444_dft_simd_common_n1bv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -208460,7 +208626,7 @@ extern "C" void XSIMD(codelet_n1bv_20) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f444_dft_simd_common_n1bv_25 {
+namespace f445_dft_simd_common_n1bv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -209319,7 +209485,7 @@ extern "C" void XSIMD(codelet_n1bv_25) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f445_dft_simd_common_n1bv_3 {
+namespace f446_dft_simd_common_n1bv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -209483,7 +209649,7 @@ extern "C" void XSIMD(codelet_n1bv_3) (planner *p) { X(kdft_register) (p, n1bv_3
 /* ==== dft/simd/common/n1bv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f446_dft_simd_common_n1bv_32 {
+namespace f447_dft_simd_common_n1bv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -210265,7 +210431,7 @@ extern "C" void XSIMD(codelet_n1bv_32) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f447_dft_simd_common_n1bv_4 {
+namespace f448_dft_simd_common_n1bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -210437,7 +210603,7 @@ extern "C" void XSIMD(codelet_n1bv_4) (planner *p) { X(kdft_register) (p, n1bv_4
 /* ==== dft/simd/common/n1bv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f448_dft_simd_common_n1bv_5 {
+namespace f449_dft_simd_common_n1bv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -210641,7 +210807,7 @@ extern "C" void XSIMD(codelet_n1bv_5) (planner *p) { X(kdft_register) (p, n1bv_5
 /* ==== dft/simd/common/n1bv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f449_dft_simd_common_n1bv_6 {
+namespace f450_dft_simd_common_n1bv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -210847,7 +211013,7 @@ extern "C" void XSIMD(codelet_n1bv_6) (planner *p) { X(kdft_register) (p, n1bv_6
 /* ==== dft/simd/common/n1bv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f450_dft_simd_common_n1bv_64 {
+namespace f451_dft_simd_common_n1bv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -212533,7 +212699,7 @@ extern "C" void XSIMD(codelet_n1bv_64) (planner *p) { X(kdft_register) (p, n1bv_
 /* ==== dft/simd/common/n1bv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f451_dft_simd_common_n1bv_7 {
+namespace f452_dft_simd_common_n1bv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -212761,7 +212927,7 @@ extern "C" void XSIMD(codelet_n1bv_7) (planner *p) { X(kdft_register) (p, n1bv_7
 /* ==== dft/simd/common/n1bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f452_dft_simd_common_n1bv_8 {
+namespace f453_dft_simd_common_n1bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -212997,7 +213163,7 @@ extern "C" void XSIMD(codelet_n1bv_8) (planner *p) { X(kdft_register) (p, n1bv_8
 /* ==== dft/simd/common/n1bv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f453_dft_simd_common_n1bv_9 {
+namespace f454_dft_simd_common_n1bv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -213306,7 +213472,7 @@ extern "C" void XSIMD(codelet_n1bv_9) (planner *p) { X(kdft_register) (p, n1bv_9
 /* ==== dft/simd/common/n1fv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f454_dft_simd_common_n1fv_10 {
+namespace f455_dft_simd_common_n1fv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -213590,7 +213756,7 @@ extern "C" void XSIMD(codelet_n1fv_10) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_11.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f455_dft_simd_common_n1fv_11 {
+namespace f456_dft_simd_common_n1fv_11 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -213912,7 +214078,7 @@ extern "C" void XSIMD(codelet_n1fv_11) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f456_dft_simd_common_n1fv_12 {
+namespace f457_dft_simd_common_n1fv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -214220,7 +214386,7 @@ extern "C" void XSIMD(codelet_n1fv_12) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_128.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f457_dft_simd_common_n1fv_128 {
+namespace f458_dft_simd_common_n1fv_128 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -217926,7 +218092,7 @@ extern "C" void XSIMD(codelet_n1fv_128) (planner *p) { X(kdft_register) (p, n1fv
 /* ==== dft/simd/common/n1fv_13.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f458_dft_simd_common_n1fv_13 {
+namespace f459_dft_simd_common_n1fv_13 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -218389,7 +218555,7 @@ extern "C" void XSIMD(codelet_n1fv_13) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_14.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f459_dft_simd_common_n1fv_14 {
+namespace f460_dft_simd_common_n1fv_14 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -218752,7 +218918,7 @@ extern "C" void XSIMD(codelet_n1fv_14) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_15.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f460_dft_simd_common_n1fv_15 {
+namespace f461_dft_simd_common_n1fv_15 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -219150,7 +219316,7 @@ extern "C" void XSIMD(codelet_n1fv_15) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f461_dft_simd_common_n1fv_16 {
+namespace f462_dft_simd_common_n1fv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -219554,7 +219720,7 @@ extern "C" void XSIMD(codelet_n1fv_16) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f462_dft_simd_common_n1fv_2 {
+namespace f463_dft_simd_common_n1fv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -219704,7 +219870,7 @@ extern "C" void XSIMD(codelet_n1fv_2) (planner *p) { X(kdft_register) (p, n1fv_2
 /* ==== dft/simd/common/n1fv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f463_dft_simd_common_n1fv_20 {
+namespace f464_dft_simd_common_n1fv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -220178,7 +220344,7 @@ extern "C" void XSIMD(codelet_n1fv_20) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f464_dft_simd_common_n1fv_25 {
+namespace f465_dft_simd_common_n1fv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -221032,7 +221198,7 @@ extern "C" void XSIMD(codelet_n1fv_25) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f465_dft_simd_common_n1fv_3 {
+namespace f466_dft_simd_common_n1fv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -221196,7 +221362,7 @@ extern "C" void XSIMD(codelet_n1fv_3) (planner *p) { X(kdft_register) (p, n1fv_3
 /* ==== dft/simd/common/n1fv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f466_dft_simd_common_n1fv_32 {
+namespace f467_dft_simd_common_n1fv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -221978,7 +222144,7 @@ extern "C" void XSIMD(codelet_n1fv_32) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f467_dft_simd_common_n1fv_4 {
+namespace f468_dft_simd_common_n1fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -222150,7 +222316,7 @@ extern "C" void XSIMD(codelet_n1fv_4) (planner *p) { X(kdft_register) (p, n1fv_4
 /* ==== dft/simd/common/n1fv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f468_dft_simd_common_n1fv_5 {
+namespace f469_dft_simd_common_n1fv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -222354,7 +222520,7 @@ extern "C" void XSIMD(codelet_n1fv_5) (planner *p) { X(kdft_register) (p, n1fv_5
 /* ==== dft/simd/common/n1fv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f469_dft_simd_common_n1fv_6 {
+namespace f470_dft_simd_common_n1fv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -222560,7 +222726,7 @@ extern "C" void XSIMD(codelet_n1fv_6) (planner *p) { X(kdft_register) (p, n1fv_6
 /* ==== dft/simd/common/n1fv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f470_dft_simd_common_n1fv_64 {
+namespace f471_dft_simd_common_n1fv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -224246,7 +224412,7 @@ extern "C" void XSIMD(codelet_n1fv_64) (planner *p) { X(kdft_register) (p, n1fv_
 /* ==== dft/simd/common/n1fv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f471_dft_simd_common_n1fv_7 {
+namespace f472_dft_simd_common_n1fv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -224474,7 +224640,7 @@ extern "C" void XSIMD(codelet_n1fv_7) (planner *p) { X(kdft_register) (p, n1fv_7
 /* ==== dft/simd/common/n1fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f472_dft_simd_common_n1fv_8 {
+namespace f473_dft_simd_common_n1fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -224710,7 +224876,7 @@ extern "C" void XSIMD(codelet_n1fv_8) (planner *p) { X(kdft_register) (p, n1fv_8
 /* ==== dft/simd/common/n1fv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f473_dft_simd_common_n1fv_9 {
+namespace f474_dft_simd_common_n1fv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -225019,7 +225185,7 @@ extern "C" void XSIMD(codelet_n1fv_9) (planner *p) { X(kdft_register) (p, n1fv_9
 /* ==== dft/simd/common/n2bv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f474_dft_simd_common_n2bv_10 {
+namespace f475_dft_simd_common_n2bv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -225351,7 +225517,7 @@ extern "C" void XSIMD(codelet_n2bv_10) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f475_dft_simd_common_n2bv_12 {
+namespace f476_dft_simd_common_n2bv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -225713,7 +225879,7 @@ extern "C" void XSIMD(codelet_n2bv_12) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_14.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f476_dft_simd_common_n2bv_14 {
+namespace f477_dft_simd_common_n2bv_14 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -226136,7 +226302,7 @@ extern "C" void XSIMD(codelet_n2bv_14) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f477_dft_simd_common_n2bv_16 {
+namespace f478_dft_simd_common_n2bv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -226618,7 +226784,7 @@ extern "C" void XSIMD(codelet_n2bv_16) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f478_dft_simd_common_n2bv_2 {
+namespace f479_dft_simd_common_n2bv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -226780,7 +226946,7 @@ extern "C" void XSIMD(codelet_n2bv_2) (planner *p) { X(kdft_register) (p, n2bv_2
 /* ==== dft/simd/common/n2bv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f479_dft_simd_common_n2bv_20 {
+namespace f480_dft_simd_common_n2bv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -227344,7 +227510,7 @@ extern "C" void XSIMD(codelet_n2bv_20) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f480_dft_simd_common_n2bv_32 {
+namespace f481_dft_simd_common_n2bv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -228264,7 +228430,7 @@ extern "C" void XSIMD(codelet_n2bv_32) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f481_dft_simd_common_n2bv_4 {
+namespace f482_dft_simd_common_n2bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -228460,7 +228626,7 @@ extern "C" void XSIMD(codelet_n2bv_4) (planner *p) { X(kdft_register) (p, n2bv_4
 /* ==== dft/simd/common/n2bv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f482_dft_simd_common_n2bv_6 {
+namespace f483_dft_simd_common_n2bv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -228696,7 +228862,7 @@ extern "C" void XSIMD(codelet_n2bv_6) (planner *p) { X(kdft_register) (p, n2bv_6
 /* ==== dft/simd/common/n2bv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f483_dft_simd_common_n2bv_64 {
+namespace f484_dft_simd_common_n2bv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -230636,7 +230802,7 @@ extern "C" void XSIMD(codelet_n2bv_64) (planner *p) { X(kdft_register) (p, n2bv_
 /* ==== dft/simd/common/n2bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f484_dft_simd_common_n2bv_8 {
+namespace f485_dft_simd_common_n2bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -230908,7 +231074,7 @@ extern "C" void XSIMD(codelet_n2bv_8) (planner *p) { X(kdft_register) (p, n2bv_8
 /* ==== dft/simd/common/n2fv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f485_dft_simd_common_n2fv_10 {
+namespace f486_dft_simd_common_n2fv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -231240,7 +231406,7 @@ extern "C" void XSIMD(codelet_n2fv_10) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f486_dft_simd_common_n2fv_12 {
+namespace f487_dft_simd_common_n2fv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -231602,7 +231768,7 @@ extern "C" void XSIMD(codelet_n2fv_12) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_14.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f487_dft_simd_common_n2fv_14 {
+namespace f488_dft_simd_common_n2fv_14 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -232025,7 +232191,7 @@ extern "C" void XSIMD(codelet_n2fv_14) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f488_dft_simd_common_n2fv_16 {
+namespace f489_dft_simd_common_n2fv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -232507,7 +232673,7 @@ extern "C" void XSIMD(codelet_n2fv_16) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f489_dft_simd_common_n2fv_2 {
+namespace f490_dft_simd_common_n2fv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -232669,7 +232835,7 @@ extern "C" void XSIMD(codelet_n2fv_2) (planner *p) { X(kdft_register) (p, n2fv_2
 /* ==== dft/simd/common/n2fv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f490_dft_simd_common_n2fv_20 {
+namespace f491_dft_simd_common_n2fv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -233233,7 +233399,7 @@ extern "C" void XSIMD(codelet_n2fv_20) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f491_dft_simd_common_n2fv_32 {
+namespace f492_dft_simd_common_n2fv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -234153,7 +234319,7 @@ extern "C" void XSIMD(codelet_n2fv_32) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f492_dft_simd_common_n2fv_4 {
+namespace f493_dft_simd_common_n2fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -234349,7 +234515,7 @@ extern "C" void XSIMD(codelet_n2fv_4) (planner *p) { X(kdft_register) (p, n2fv_4
 /* ==== dft/simd/common/n2fv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f493_dft_simd_common_n2fv_6 {
+namespace f494_dft_simd_common_n2fv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -234585,7 +234751,7 @@ extern "C" void XSIMD(codelet_n2fv_6) (planner *p) { X(kdft_register) (p, n2fv_6
 /* ==== dft/simd/common/n2fv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f494_dft_simd_common_n2fv_64 {
+namespace f495_dft_simd_common_n2fv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -236525,7 +236691,7 @@ extern "C" void XSIMD(codelet_n2fv_64) (planner *p) { X(kdft_register) (p, n2fv_
 /* ==== dft/simd/common/n2fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f495_dft_simd_common_n2fv_8 {
+namespace f496_dft_simd_common_n2fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -236797,7 +236963,7 @@ extern "C" void XSIMD(codelet_n2fv_8) (planner *p) { X(kdft_register) (p, n2fv_8
 /* ==== dft/simd/common/n2sv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f496_dft_simd_common_n2sv_16 {
+namespace f497_dft_simd_common_n2sv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -237529,7 +237695,7 @@ extern "C" void XSIMD(codelet_n2sv_16) (planner *p) { X(kdft_register) (p, n2sv_
 /* ==== dft/simd/common/n2sv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f497_dft_simd_common_n2sv_32 {
+namespace f498_dft_simd_common_n2sv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -239101,7 +239267,7 @@ extern "C" void XSIMD(codelet_n2sv_32) (planner *p) { X(kdft_register) (p, n2sv_
 /* ==== dft/simd/common/n2sv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f498_dft_simd_common_n2sv_4 {
+namespace f499_dft_simd_common_n2sv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -239333,7 +239499,7 @@ extern "C" void XSIMD(codelet_n2sv_4) (planner *p) { X(kdft_register) (p, n2sv_4
 /* ==== dft/simd/common/n2sv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f499_dft_simd_common_n2sv_64 {
+namespace f500_dft_simd_common_n2sv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -242879,7 +243045,7 @@ extern "C" void XSIMD(codelet_n2sv_64) (planner *p) { X(kdft_register) (p, n2sv_
 /* ==== dft/simd/common/n2sv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f500_dft_simd_common_n2sv_8 {
+namespace f501_dft_simd_common_n2sv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -243265,7 +243431,7 @@ extern "C" void XSIMD(codelet_n2sv_8) (planner *p) { X(kdft_register) (p, n2sv_8
 /* ==== dft/simd/common/q1bv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f501_dft_simd_common_q1bv_2 {
+namespace f502_dft_simd_common_q1bv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -243449,7 +243615,7 @@ extern "C" void XSIMD(codelet_q1bv_2) (planner *p) {
 /* ==== dft/simd/common/q1bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f502_dft_simd_common_q1bv_4 {
+namespace f503_dft_simd_common_q1bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -243781,7 +243947,7 @@ extern "C" void XSIMD(codelet_q1bv_4) (planner *p) {
 /* ==== dft/simd/common/q1bv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f503_dft_simd_common_q1bv_5 {
+namespace f504_dft_simd_common_q1bv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -244301,7 +244467,7 @@ extern "C" void XSIMD(codelet_q1bv_5) (planner *p) {
 /* ==== dft/simd/common/q1bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f504_dft_simd_common_q1bv_8 {
+namespace f505_dft_simd_common_q1bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -245407,7 +245573,7 @@ extern "C" void XSIMD(codelet_q1bv_8) (planner *p) {
 /* ==== dft/simd/common/q1fv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f505_dft_simd_common_q1fv_2 {
+namespace f506_dft_simd_common_q1fv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -245591,7 +245757,7 @@ extern "C" void XSIMD(codelet_q1fv_2) (planner *p) {
 /* ==== dft/simd/common/q1fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f506_dft_simd_common_q1fv_4 {
+namespace f507_dft_simd_common_q1fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -245923,7 +246089,7 @@ extern "C" void XSIMD(codelet_q1fv_4) (planner *p) {
 /* ==== dft/simd/common/q1fv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f507_dft_simd_common_q1fv_5 {
+namespace f508_dft_simd_common_q1fv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -246443,7 +246609,7 @@ extern "C" void XSIMD(codelet_q1fv_5) (planner *p) {
 /* ==== dft/simd/common/q1fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f508_dft_simd_common_q1fv_8 {
+namespace f509_dft_simd_common_q1fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -247549,7 +247715,7 @@ extern "C" void XSIMD(codelet_q1fv_8) (planner *p) {
 /* ==== dft/simd/common/t1buv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f509_dft_simd_common_t1buv_10 {
+namespace f510_dft_simd_common_t1buv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -247897,7 +248063,7 @@ extern "C" void XSIMD(codelet_t1buv_10) (planner *p) {
 /* ==== dft/simd/common/t1buv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f510_dft_simd_common_t1buv_2 {
+namespace f511_dft_simd_common_t1buv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -248071,7 +248237,7 @@ extern "C" void XSIMD(codelet_t1buv_2) (planner *p) {
 /* ==== dft/simd/common/t1buv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f511_dft_simd_common_t1buv_3 {
+namespace f512_dft_simd_common_t1buv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -248263,7 +248429,7 @@ extern "C" void XSIMD(codelet_t1buv_3) (planner *p) {
 /* ==== dft/simd/common/t1buv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f512_dft_simd_common_t1buv_4 {
+namespace f513_dft_simd_common_t1buv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -248467,7 +248633,7 @@ extern "C" void XSIMD(codelet_t1buv_4) (planner *p) {
 /* ==== dft/simd/common/t1buv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f513_dft_simd_common_t1buv_5 {
+namespace f514_dft_simd_common_t1buv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -248713,7 +248879,7 @@ extern "C" void XSIMD(codelet_t1buv_5) (planner *p) {
 /* ==== dft/simd/common/t1buv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f514_dft_simd_common_t1buv_6 {
+namespace f515_dft_simd_common_t1buv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -248965,7 +249131,7 @@ extern "C" void XSIMD(codelet_t1buv_6) (planner *p) {
 /* ==== dft/simd/common/t1buv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f515_dft_simd_common_t1buv_7 {
+namespace f516_dft_simd_common_t1buv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -249251,7 +249417,7 @@ extern "C" void XSIMD(codelet_t1buv_7) (planner *p) {
 /* ==== dft/simd/common/t1buv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f516_dft_simd_common_t1buv_8 {
+namespace f517_dft_simd_common_t1buv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -249541,7 +249707,7 @@ extern "C" void XSIMD(codelet_t1buv_8) (planner *p) {
 /* ==== dft/simd/common/t1buv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f517_dft_simd_common_t1buv_9 {
+namespace f518_dft_simd_common_t1buv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -249907,7 +250073,7 @@ extern "C" void XSIMD(codelet_t1buv_9) (planner *p) {
 /* ==== dft/simd/common/t1bv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f518_dft_simd_common_t1bv_10 {
+namespace f519_dft_simd_common_t1bv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -250265,7 +250431,7 @@ extern "C" void XSIMD(codelet_t1bv_10) (planner *p) {
 /* ==== dft/simd/common/t1bv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f519_dft_simd_common_t1bv_12 {
+namespace f520_dft_simd_common_t1bv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -250667,7 +250833,7 @@ extern "C" void XSIMD(codelet_t1bv_12) (planner *p) {
 /* ==== dft/simd/common/t1bv_15.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f520_dft_simd_common_t1bv_15 {
+namespace f521_dft_simd_common_t1bv_15 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -251173,7 +251339,7 @@ extern "C" void XSIMD(codelet_t1bv_15) (planner *p) {
 /* ==== dft/simd/common/t1bv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f521_dft_simd_common_t1bv_16 {
+namespace f522_dft_simd_common_t1bv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -251679,7 +251845,7 @@ extern "C" void XSIMD(codelet_t1bv_16) (planner *p) {
 /* ==== dft/simd/common/t1bv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f522_dft_simd_common_t1bv_2 {
+namespace f523_dft_simd_common_t1bv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -251863,7 +252029,7 @@ extern "C" void XSIMD(codelet_t1bv_2) (planner *p) {
 /* ==== dft/simd/common/t1bv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f523_dft_simd_common_t1bv_20 {
+namespace f524_dft_simd_common_t1bv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -252467,7 +252633,7 @@ extern "C" void XSIMD(codelet_t1bv_20) (planner *p) {
 /* ==== dft/simd/common/t1bv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f524_dft_simd_common_t1bv_25 {
+namespace f525_dft_simd_common_t1bv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -253491,7 +253657,7 @@ extern "C" void XSIMD(codelet_t1bv_25) (planner *p) {
 /* ==== dft/simd/common/t1bv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f525_dft_simd_common_t1bv_3 {
+namespace f526_dft_simd_common_t1bv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -253693,7 +253859,7 @@ extern "C" void XSIMD(codelet_t1bv_3) (planner *p) {
 /* ==== dft/simd/common/t1bv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f526_dft_simd_common_t1bv_32 {
+namespace f527_dft_simd_common_t1bv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -254671,7 +254837,7 @@ extern "C" void XSIMD(codelet_t1bv_32) (planner *p) {
 /* ==== dft/simd/common/t1bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f527_dft_simd_common_t1bv_4 {
+namespace f528_dft_simd_common_t1bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -254885,7 +255051,7 @@ extern "C" void XSIMD(codelet_t1bv_4) (planner *p) {
 /* ==== dft/simd/common/t1bv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f528_dft_simd_common_t1bv_5 {
+namespace f529_dft_simd_common_t1bv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -255141,7 +255307,7 @@ extern "C" void XSIMD(codelet_t1bv_5) (planner *p) {
 /* ==== dft/simd/common/t1bv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f529_dft_simd_common_t1bv_6 {
+namespace f530_dft_simd_common_t1bv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -255403,7 +255569,7 @@ extern "C" void XSIMD(codelet_t1bv_6) (planner *p) {
 /* ==== dft/simd/common/t1bv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f530_dft_simd_common_t1bv_64 {
+namespace f531_dft_simd_common_t1bv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -257431,7 +257597,7 @@ extern "C" void XSIMD(codelet_t1bv_64) (planner *p) {
 /* ==== dft/simd/common/t1bv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f531_dft_simd_common_t1bv_7 {
+namespace f532_dft_simd_common_t1bv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -257727,7 +257893,7 @@ extern "C" void XSIMD(codelet_t1bv_7) (planner *p) {
 /* ==== dft/simd/common/t1bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f532_dft_simd_common_t1bv_8 {
+namespace f533_dft_simd_common_t1bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -258027,7 +258193,7 @@ extern "C" void XSIMD(codelet_t1bv_8) (planner *p) {
 /* ==== dft/simd/common/t1bv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f533_dft_simd_common_t1bv_9 {
+namespace f534_dft_simd_common_t1bv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -258403,7 +258569,7 @@ extern "C" void XSIMD(codelet_t1bv_9) (planner *p) {
 /* ==== dft/simd/common/t1fuv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f534_dft_simd_common_t1fuv_10 {
+namespace f535_dft_simd_common_t1fuv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -258751,7 +258917,7 @@ extern "C" void XSIMD(codelet_t1fuv_10) (planner *p) {
 /* ==== dft/simd/common/t1fuv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f535_dft_simd_common_t1fuv_2 {
+namespace f536_dft_simd_common_t1fuv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -258925,7 +259091,7 @@ extern "C" void XSIMD(codelet_t1fuv_2) (planner *p) {
 /* ==== dft/simd/common/t1fuv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f536_dft_simd_common_t1fuv_3 {
+namespace f537_dft_simd_common_t1fuv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -259117,7 +259283,7 @@ extern "C" void XSIMD(codelet_t1fuv_3) (planner *p) {
 /* ==== dft/simd/common/t1fuv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f537_dft_simd_common_t1fuv_4 {
+namespace f538_dft_simd_common_t1fuv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -259321,7 +259487,7 @@ extern "C" void XSIMD(codelet_t1fuv_4) (planner *p) {
 /* ==== dft/simd/common/t1fuv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f538_dft_simd_common_t1fuv_5 {
+namespace f539_dft_simd_common_t1fuv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -259567,7 +259733,7 @@ extern "C" void XSIMD(codelet_t1fuv_5) (planner *p) {
 /* ==== dft/simd/common/t1fuv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f539_dft_simd_common_t1fuv_6 {
+namespace f540_dft_simd_common_t1fuv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -259819,7 +259985,7 @@ extern "C" void XSIMD(codelet_t1fuv_6) (planner *p) {
 /* ==== dft/simd/common/t1fuv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f540_dft_simd_common_t1fuv_7 {
+namespace f541_dft_simd_common_t1fuv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -260105,7 +260271,7 @@ extern "C" void XSIMD(codelet_t1fuv_7) (planner *p) {
 /* ==== dft/simd/common/t1fuv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f541_dft_simd_common_t1fuv_8 {
+namespace f542_dft_simd_common_t1fuv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -260395,7 +260561,7 @@ extern "C" void XSIMD(codelet_t1fuv_8) (planner *p) {
 /* ==== dft/simd/common/t1fuv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f542_dft_simd_common_t1fuv_9 {
+namespace f543_dft_simd_common_t1fuv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -260761,7 +260927,7 @@ extern "C" void XSIMD(codelet_t1fuv_9) (planner *p) {
 /* ==== dft/simd/common/t1fv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f543_dft_simd_common_t1fv_10 {
+namespace f544_dft_simd_common_t1fv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -261119,7 +261285,7 @@ extern "C" void XSIMD(codelet_t1fv_10) (planner *p) {
 /* ==== dft/simd/common/t1fv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f544_dft_simd_common_t1fv_12 {
+namespace f545_dft_simd_common_t1fv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -261521,7 +261687,7 @@ extern "C" void XSIMD(codelet_t1fv_12) (planner *p) {
 /* ==== dft/simd/common/t1fv_15.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f545_dft_simd_common_t1fv_15 {
+namespace f546_dft_simd_common_t1fv_15 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -262027,7 +262193,7 @@ extern "C" void XSIMD(codelet_t1fv_15) (planner *p) {
 /* ==== dft/simd/common/t1fv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f546_dft_simd_common_t1fv_16 {
+namespace f547_dft_simd_common_t1fv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -262533,7 +262699,7 @@ extern "C" void XSIMD(codelet_t1fv_16) (planner *p) {
 /* ==== dft/simd/common/t1fv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f547_dft_simd_common_t1fv_2 {
+namespace f548_dft_simd_common_t1fv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -262717,7 +262883,7 @@ extern "C" void XSIMD(codelet_t1fv_2) (planner *p) {
 /* ==== dft/simd/common/t1fv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f548_dft_simd_common_t1fv_20 {
+namespace f549_dft_simd_common_t1fv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -263321,7 +263487,7 @@ extern "C" void XSIMD(codelet_t1fv_20) (planner *p) {
 /* ==== dft/simd/common/t1fv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f549_dft_simd_common_t1fv_25 {
+namespace f550_dft_simd_common_t1fv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -264343,7 +264509,7 @@ extern "C" void XSIMD(codelet_t1fv_25) (planner *p) {
 /* ==== dft/simd/common/t1fv_3.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f550_dft_simd_common_t1fv_3 {
+namespace f551_dft_simd_common_t1fv_3 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -264545,7 +264711,7 @@ extern "C" void XSIMD(codelet_t1fv_3) (planner *p) {
 /* ==== dft/simd/common/t1fv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f551_dft_simd_common_t1fv_32 {
+namespace f552_dft_simd_common_t1fv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -265523,7 +265689,7 @@ extern "C" void XSIMD(codelet_t1fv_32) (planner *p) {
 /* ==== dft/simd/common/t1fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f552_dft_simd_common_t1fv_4 {
+namespace f553_dft_simd_common_t1fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -265737,7 +265903,7 @@ extern "C" void XSIMD(codelet_t1fv_4) (planner *p) {
 /* ==== dft/simd/common/t1fv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f553_dft_simd_common_t1fv_5 {
+namespace f554_dft_simd_common_t1fv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -265993,7 +266159,7 @@ extern "C" void XSIMD(codelet_t1fv_5) (planner *p) {
 /* ==== dft/simd/common/t1fv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f554_dft_simd_common_t1fv_6 {
+namespace f555_dft_simd_common_t1fv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -266255,7 +266421,7 @@ extern "C" void XSIMD(codelet_t1fv_6) (planner *p) {
 /* ==== dft/simd/common/t1fv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f555_dft_simd_common_t1fv_64 {
+namespace f556_dft_simd_common_t1fv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -268283,7 +268449,7 @@ extern "C" void XSIMD(codelet_t1fv_64) (planner *p) {
 /* ==== dft/simd/common/t1fv_7.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f556_dft_simd_common_t1fv_7 {
+namespace f557_dft_simd_common_t1fv_7 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -268579,7 +268745,7 @@ extern "C" void XSIMD(codelet_t1fv_7) (planner *p) {
 /* ==== dft/simd/common/t1fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f557_dft_simd_common_t1fv_8 {
+namespace f558_dft_simd_common_t1fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -268879,7 +269045,7 @@ extern "C" void XSIMD(codelet_t1fv_8) (planner *p) {
 /* ==== dft/simd/common/t1fv_9.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f558_dft_simd_common_t1fv_9 {
+namespace f559_dft_simd_common_t1fv_9 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -269255,7 +269421,7 @@ extern "C" void XSIMD(codelet_t1fv_9) (planner *p) {
 /* ==== dft/simd/common/t1sv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f559_dft_simd_common_t1sv_16 {
+namespace f560_dft_simd_common_t1sv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -270158,7 +270324,7 @@ extern "C" void XSIMD(codelet_t1sv_16) (planner *p) {
 /* ==== dft/simd/common/t1sv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f560_dft_simd_common_t1sv_2 {
+namespace f561_dft_simd_common_t1sv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -270354,7 +270520,7 @@ extern "C" void XSIMD(codelet_t1sv_2) (planner *p) {
 /* ==== dft/simd/common/t1sv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f561_dft_simd_common_t1sv_32 {
+namespace f562_dft_simd_common_t1sv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -272302,7 +272468,7 @@ extern "C" void XSIMD(codelet_t1sv_32) (planner *p) {
 /* ==== dft/simd/common/t1sv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f562_dft_simd_common_t1sv_4 {
+namespace f563_dft_simd_common_t1sv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -272581,7 +272747,7 @@ extern "C" void XSIMD(codelet_t1sv_4) (planner *p) {
 /* ==== dft/simd/common/t1sv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f563_dft_simd_common_t1sv_8 {
+namespace f564_dft_simd_common_t1sv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -273048,7 +273214,7 @@ extern "C" void XSIMD(codelet_t1sv_8) (planner *p) {
 /* ==== dft/simd/common/t2bv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f564_dft_simd_common_t2bv_10 {
+namespace f565_dft_simd_common_t2bv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -273406,7 +273572,7 @@ extern "C" void XSIMD(codelet_t2bv_10) (planner *p) {
 /* ==== dft/simd/common/t2bv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f565_dft_simd_common_t2bv_16 {
+namespace f566_dft_simd_common_t2bv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -273912,7 +274078,7 @@ extern "C" void XSIMD(codelet_t2bv_16) (planner *p) {
 /* ==== dft/simd/common/t2bv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f566_dft_simd_common_t2bv_2 {
+namespace f567_dft_simd_common_t2bv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -274096,7 +274262,7 @@ extern "C" void XSIMD(codelet_t2bv_2) (planner *p) {
 /* ==== dft/simd/common/t2bv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f567_dft_simd_common_t2bv_20 {
+namespace f568_dft_simd_common_t2bv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -274700,7 +274866,7 @@ extern "C" void XSIMD(codelet_t2bv_20) (planner *p) {
 /* ==== dft/simd/common/t2bv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f568_dft_simd_common_t2bv_25 {
+namespace f569_dft_simd_common_t2bv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -275724,7 +275890,7 @@ extern "C" void XSIMD(codelet_t2bv_25) (planner *p) {
 /* ==== dft/simd/common/t2bv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f569_dft_simd_common_t2bv_32 {
+namespace f570_dft_simd_common_t2bv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -276702,7 +276868,7 @@ extern "C" void XSIMD(codelet_t2bv_32) (planner *p) {
 /* ==== dft/simd/common/t2bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f570_dft_simd_common_t2bv_4 {
+namespace f571_dft_simd_common_t2bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -276916,7 +277082,7 @@ extern "C" void XSIMD(codelet_t2bv_4) (planner *p) {
 /* ==== dft/simd/common/t2bv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f571_dft_simd_common_t2bv_5 {
+namespace f572_dft_simd_common_t2bv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -277172,7 +277338,7 @@ extern "C" void XSIMD(codelet_t2bv_5) (planner *p) {
 /* ==== dft/simd/common/t2bv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f572_dft_simd_common_t2bv_64 {
+namespace f573_dft_simd_common_t2bv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -279200,7 +279366,7 @@ extern "C" void XSIMD(codelet_t2bv_64) (planner *p) {
 /* ==== dft/simd/common/t2bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f573_dft_simd_common_t2bv_8 {
+namespace f574_dft_simd_common_t2bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -279500,7 +279666,7 @@ extern "C" void XSIMD(codelet_t2bv_8) (planner *p) {
 /* ==== dft/simd/common/t2fv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f574_dft_simd_common_t2fv_10 {
+namespace f575_dft_simd_common_t2fv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -279858,7 +280024,7 @@ extern "C" void XSIMD(codelet_t2fv_10) (planner *p) {
 /* ==== dft/simd/common/t2fv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f575_dft_simd_common_t2fv_16 {
+namespace f576_dft_simd_common_t2fv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -280364,7 +280530,7 @@ extern "C" void XSIMD(codelet_t2fv_16) (planner *p) {
 /* ==== dft/simd/common/t2fv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f576_dft_simd_common_t2fv_2 {
+namespace f577_dft_simd_common_t2fv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -280548,7 +280714,7 @@ extern "C" void XSIMD(codelet_t2fv_2) (planner *p) {
 /* ==== dft/simd/common/t2fv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f577_dft_simd_common_t2fv_20 {
+namespace f578_dft_simd_common_t2fv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -281152,7 +281318,7 @@ extern "C" void XSIMD(codelet_t2fv_20) (planner *p) {
 /* ==== dft/simd/common/t2fv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f578_dft_simd_common_t2fv_25 {
+namespace f579_dft_simd_common_t2fv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -282174,7 +282340,7 @@ extern "C" void XSIMD(codelet_t2fv_25) (planner *p) {
 /* ==== dft/simd/common/t2fv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f579_dft_simd_common_t2fv_32 {
+namespace f580_dft_simd_common_t2fv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -283152,7 +283318,7 @@ extern "C" void XSIMD(codelet_t2fv_32) (planner *p) {
 /* ==== dft/simd/common/t2fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f580_dft_simd_common_t2fv_4 {
+namespace f581_dft_simd_common_t2fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -283366,7 +283532,7 @@ extern "C" void XSIMD(codelet_t2fv_4) (planner *p) {
 /* ==== dft/simd/common/t2fv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f581_dft_simd_common_t2fv_5 {
+namespace f582_dft_simd_common_t2fv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -283622,7 +283788,7 @@ extern "C" void XSIMD(codelet_t2fv_5) (planner *p) {
 /* ==== dft/simd/common/t2fv_64.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f582_dft_simd_common_t2fv_64 {
+namespace f583_dft_simd_common_t2fv_64 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -285650,7 +285816,7 @@ extern "C" void XSIMD(codelet_t2fv_64) (planner *p) {
 /* ==== dft/simd/common/t2fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f583_dft_simd_common_t2fv_8 {
+namespace f584_dft_simd_common_t2fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -285950,7 +286116,7 @@ extern "C" void XSIMD(codelet_t2fv_8) (planner *p) {
 /* ==== dft/simd/common/t2sv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f584_dft_simd_common_t2sv_16 {
+namespace f585_dft_simd_common_t2sv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -286865,7 +287031,7 @@ extern "C" void XSIMD(codelet_t2sv_16) (planner *p) {
 /* ==== dft/simd/common/t2sv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f585_dft_simd_common_t2sv_32 {
+namespace f586_dft_simd_common_t2sv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -288837,7 +289003,7 @@ extern "C" void XSIMD(codelet_t2sv_32) (planner *p) {
 /* ==== dft/simd/common/t2sv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f586_dft_simd_common_t2sv_4 {
+namespace f587_dft_simd_common_t2sv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -289116,7 +289282,7 @@ extern "C" void XSIMD(codelet_t2sv_4) (planner *p) {
 /* ==== dft/simd/common/t2sv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f587_dft_simd_common_t2sv_8 {
+namespace f588_dft_simd_common_t2sv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -289585,7 +289751,7 @@ extern "C" void XSIMD(codelet_t2sv_8) (planner *p) {
 /* ==== dft/simd/common/t3bv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f588_dft_simd_common_t3bv_10 {
+namespace f589_dft_simd_common_t3bv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -289954,7 +290120,7 @@ extern "C" void XSIMD(codelet_t3bv_10) (planner *p) {
 /* ==== dft/simd/common/t3bv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f589_dft_simd_common_t3bv_16 {
+namespace f590_dft_simd_common_t3bv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -290473,7 +290639,7 @@ extern "C" void XSIMD(codelet_t3bv_16) (planner *p) {
 /* ==== dft/simd/common/t3bv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f590_dft_simd_common_t3bv_20 {
+namespace f591_dft_simd_common_t3bv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -291092,7 +291258,7 @@ extern "C" void XSIMD(codelet_t3bv_20) (planner *p) {
 /* ==== dft/simd/common/t3bv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f591_dft_simd_common_t3bv_25 {
+namespace f592_dft_simd_common_t3bv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -292131,7 +292297,7 @@ extern "C" void XSIMD(codelet_t3bv_25) (planner *p) {
 /* ==== dft/simd/common/t3bv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f592_dft_simd_common_t3bv_32 {
+namespace f593_dft_simd_common_t3bv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -293126,7 +293292,7 @@ extern "C" void XSIMD(codelet_t3bv_32) (planner *p) {
 /* ==== dft/simd/common/t3bv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f593_dft_simd_common_t3bv_4 {
+namespace f594_dft_simd_common_t3bv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -293349,7 +293515,7 @@ extern "C" void XSIMD(codelet_t3bv_4) (planner *p) {
 /* ==== dft/simd/common/t3bv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f594_dft_simd_common_t3bv_5 {
+namespace f595_dft_simd_common_t3bv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -293614,7 +293780,7 @@ extern "C" void XSIMD(codelet_t3bv_5) (planner *p) {
 /* ==== dft/simd/common/t3bv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f595_dft_simd_common_t3bv_8 {
+namespace f596_dft_simd_common_t3bv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -293925,7 +294091,7 @@ extern "C" void XSIMD(codelet_t3bv_8) (planner *p) {
 /* ==== dft/simd/common/t3fv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f596_dft_simd_common_t3fv_10 {
+namespace f597_dft_simd_common_t3fv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -294294,7 +294460,7 @@ extern "C" void XSIMD(codelet_t3fv_10) (planner *p) {
 /* ==== dft/simd/common/t3fv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f597_dft_simd_common_t3fv_16 {
+namespace f598_dft_simd_common_t3fv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -294813,7 +294979,7 @@ extern "C" void XSIMD(codelet_t3fv_16) (planner *p) {
 /* ==== dft/simd/common/t3fv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f598_dft_simd_common_t3fv_20 {
+namespace f599_dft_simd_common_t3fv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -295432,7 +295598,7 @@ extern "C" void XSIMD(codelet_t3fv_20) (planner *p) {
 /* ==== dft/simd/common/t3fv_25.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f599_dft_simd_common_t3fv_25 {
+namespace f600_dft_simd_common_t3fv_25 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -296469,7 +296635,7 @@ extern "C" void XSIMD(codelet_t3fv_25) (planner *p) {
 /* ==== dft/simd/common/t3fv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f600_dft_simd_common_t3fv_32 {
+namespace f601_dft_simd_common_t3fv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -297464,7 +297630,7 @@ extern "C" void XSIMD(codelet_t3fv_32) (planner *p) {
 /* ==== dft/simd/common/t3fv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f601_dft_simd_common_t3fv_4 {
+namespace f602_dft_simd_common_t3fv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -297687,7 +297853,7 @@ extern "C" void XSIMD(codelet_t3fv_4) (planner *p) {
 /* ==== dft/simd/common/t3fv_5.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f602_dft_simd_common_t3fv_5 {
+namespace f603_dft_simd_common_t3fv_5 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -297952,7 +298118,7 @@ extern "C" void XSIMD(codelet_t3fv_5) (planner *p) {
 /* ==== dft/simd/common/t3fv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f603_dft_simd_common_t3fv_8 {
+namespace f604_dft_simd_common_t3fv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -298263,7 +298429,7 @@ extern "C" void XSIMD(codelet_t3fv_8) (planner *p) {
 /* ==== rdft/simd/common/codlist.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f604_rdft_simd_common_codlist {
+namespace f605_rdft_simd_common_codlist {
 
 extern "C" void XSIMD(codelet_hc2cfdftv_2)(planner *);
 extern "C" void XSIMD(codelet_hc2cfdftv_4)(planner *);
@@ -298317,7 +298483,7 @@ extern "C" const solvtab XSIMD(solvtab_rdft) = {
 /* ==== rdft/simd/common/genus.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f605_rdft_simd_common_genus {
+namespace f606_rdft_simd_common_genus {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -298384,7 +298550,7 @@ extern "C" { EXTERN_CONST(hc2c_genus, XSIMD(rdft_hc2cfv_genus)) = { hc2cfv_okp, 
 /* ==== rdft/simd/common/hc2cbdftv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f606_rdft_simd_common_hc2cbdftv_10 {
+namespace f607_rdft_simd_common_hc2cbdftv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -298744,7 +298910,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_10) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f607_rdft_simd_common_hc2cbdftv_12 {
+namespace f608_rdft_simd_common_hc2cbdftv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -299136,7 +299302,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_12) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f608_rdft_simd_common_hc2cbdftv_16 {
+namespace f609_rdft_simd_common_hc2cbdftv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -299629,7 +299795,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_16) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f609_rdft_simd_common_hc2cbdftv_2 {
+namespace f610_rdft_simd_common_hc2cbdftv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -299803,7 +299969,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_2) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f610_rdft_simd_common_hc2cbdftv_20 {
+namespace f611_rdft_simd_common_hc2cbdftv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -300413,7 +300579,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_20) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f611_rdft_simd_common_hc2cbdftv_32 {
+namespace f612_rdft_simd_common_hc2cbdftv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -301350,7 +301516,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_32) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f612_rdft_simd_common_hc2cbdftv_4 {
+namespace f613_rdft_simd_common_hc2cbdftv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -301559,7 +301725,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_4) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f613_rdft_simd_common_hc2cbdftv_6 {
+namespace f614_rdft_simd_common_hc2cbdftv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -301815,7 +301981,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_6) (planner *p) {
 /* ==== rdft/simd/common/hc2cbdftv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f614_rdft_simd_common_hc2cbdftv_8 {
+namespace f615_rdft_simd_common_hc2cbdftv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -302108,7 +302274,7 @@ extern "C" void XSIMD(codelet_hc2cbdftv_8) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_10.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f615_rdft_simd_common_hc2cfdftv_10 {
+namespace f616_rdft_simd_common_hc2cfdftv_10 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -302470,7 +302636,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_10) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_12.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f616_rdft_simd_common_hc2cfdftv_12 {
+namespace f617_rdft_simd_common_hc2cfdftv_12 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -302865,7 +303031,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_12) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_16.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f617_rdft_simd_common_hc2cfdftv_16 {
+namespace f618_rdft_simd_common_hc2cfdftv_16 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -303362,7 +303528,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_16) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_2.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f618_rdft_simd_common_hc2cfdftv_2 {
+namespace f619_rdft_simd_common_hc2cfdftv_2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -303538,7 +303704,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_2) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_20.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f619_rdft_simd_common_hc2cfdftv_20 {
+namespace f620_rdft_simd_common_hc2cfdftv_20 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -304154,7 +304320,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_20) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_32.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f620_rdft_simd_common_hc2cfdftv_32 {
+namespace f621_rdft_simd_common_hc2cfdftv_32 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -305097,7 +305263,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_32) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_4.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f621_rdft_simd_common_hc2cfdftv_4 {
+namespace f622_rdft_simd_common_hc2cfdftv_4 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -305308,7 +305474,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_4) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_6.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f622_rdft_simd_common_hc2cfdftv_6 {
+namespace f623_rdft_simd_common_hc2cfdftv_6 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -305565,7 +305731,7 @@ extern "C" void XSIMD(codelet_hc2cfdftv_6) (planner *p) {
 /* ==== rdft/simd/common/hc2cfdftv_8.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f623_rdft_simd_common_hc2cfdftv_8 {
+namespace f624_rdft_simd_common_hc2cfdftv_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
  * Copyright (c) 2003, 2007-14 Massachusetts Institute of Technology
@@ -305861,11 +306027,12 @@ extern "C" void XSIMD(codelet_hc2cfdftv_8) (planner *p) {
 /* ==== fftchode/rdft2-pair.c ==== */
 #pragma push_macro("LD")
 #pragma push_macro("ST")
-namespace f624_fftchode_rdft2_pair {
+namespace f625_fftchode_rdft2_pair {
 /*
- * fftchode (FFTE-6, opt/simd): real-data transforms of adjacent columns
- * (real-side vector stride 1, as MATLAB fft(x,[],2) of a real matrix) by
- * one complex SIMD DFT per pair of columns ("two real DFTs for one complex").
+ * fftchode (FFTE-6, opt/simd): batches of real-data transforms, either of
+ * adjacent columns (real-side vector stride 1, as MATLAB fft(x,[],2) of a real
+ * matrix) or of odd size n (where FFTW has no half-length complex path), by
+ * one complex SIMD DFT per pair of transforms ("two real DFTs for one complex").
  *
  *   R2HC: z = x_2p + i x_2p+1, Z = DFT(z),
  *         X_2p[f] = (Z[f] + conj Z[n-f]) / 2, X_2p+1[f] = i (conj Z[n-f] - Z[f]) / 2
@@ -305890,23 +306057,32 @@ typedef struct {
 typedef struct {
      plan_rdft2 super;
      plan *cld, *cldlast, *cldrest;
-     INT n, b2, nblk, last, rs, cs, cv, ncols;
+     INT n, b2, nblk, last, rs, rv, cs, cv, ncols;
      int simd;
 } P;
 
-/* real side: SIMD when every row of pairs is complex-aligned, else scalar (odd row count) */
-static void pack_r2hc(const R *x, R *B, INT n, INT rs, INT nb, int simd)
+/* real side: SIMD when the pairs are adjacent, complex-aligned reals (columns
+   with an even row count), else scalar in the order of the smaller stride */
+static void pack_r2hc(const R *x, R *B, INT n, INT rs, INT rv, INT nb, int simd)
 {
      INT f, p;
-     for (f = 0; f < n; ++f) {
-	  const R *xf = x + f * rs;
-	  if (simd)
+     if (simd) {
+	  for (f = 0; f < n; ++f) {
+	       const R *xf = x + f * rs;
 	       for (p = 0; p < nb; p += VL)
 		    ST(B + 2 * (p * n + f), LD(xf + 2 * p, 2, xf + 2 * p), 2 * n, B + 2 * f);
-	  else
+	  }
+     } else if (X(iabs)(rs) >= X(iabs)(rv)) {
+	  for (f = 0; f < n; ++f)
 	       for (p = 0; p < nb; ++p) {
-		    B[2 * (p * n + f)] = xf[2 * p];
-		    B[2 * (p * n + f) + 1] = xf[2 * p + 1];
+		    B[2 * (p * n + f)] = x[f * rs + 2 * p * rv];
+		    B[2 * (p * n + f) + 1] = x[f * rs + (2 * p + 1) * rv];
+	       }
+     } else {
+	  for (p = 0; p < nb; ++p)
+	       for (f = 0; f < n; ++f) {
+		    B[2 * (p * n + f)] = x[f * rs + 2 * p * rv];
+		    B[2 * (p * n + f) + 1] = x[f * rs + (2 * p + 1) * rv];
 	       }
      }
 }
@@ -305951,18 +306127,26 @@ static void pre_hc2r(const R *cr, R *B, INT n, INT cs, INT cv, INT nb)
      }
 }
 
-static void unpack_hc2r(const R *B, R *x, INT n, INT rs, INT nb, int simd)
+static void unpack_hc2r(const R *B, R *x, INT n, INT rs, INT rv, INT nb, int simd)
 {
      INT f, p;
-     for (f = 0; f < n; ++f) {
-	  R *xf = x + f * rs;
-	  if (simd)
+     if (simd) {
+	  for (f = 0; f < n; ++f) {
+	       R *xf = x + f * rs;
 	       for (p = 0; p < nb; p += VL)
 		    ST(xf + 2 * p, LD(B + 2 * (p * n + f), 2 * n, B + 2 * f), 2, xf + 2 * p);
-	  else
+	  }
+     } else if (X(iabs)(rs) >= X(iabs)(rv)) {
+	  for (f = 0; f < n; ++f)
 	       for (p = 0; p < nb; ++p) {
-		    xf[2 * p] = B[2 * (p * n + f)];
-		    xf[2 * p + 1] = B[2 * (p * n + f) + 1];
+		    x[f * rs + 2 * p * rv] = B[2 * (p * n + f)];
+		    x[f * rs + (2 * p + 1) * rv] = B[2 * (p * n + f) + 1];
+	       }
+     } else {
+	  for (p = 0; p < nb; ++p)
+	       for (f = 0; f < n; ++f) {
+		    x[f * rs + 2 * p * rv] = B[2 * (p * n + f)];
+		    x[f * rs + (2 * p + 1) * rv] = B[2 * (p * n + f) + 1];
 	       }
      }
 }
@@ -305970,23 +306154,23 @@ static void unpack_hc2r(const R *B, R *x, INT n, INT rs, INT nb, int simd)
 static void apply_r2hc(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
 {
      const P *ego = (const P *) ego_;
-     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, cs = ego->cs, cv = ego->cv;
+     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, rv = ego->rv, cs = ego->cs, cv = ego->cv;
      R *B = (R *) MALLOC(sizeof(R) * 4 * n * b2, BUFFERS), *C = B + 2 * n * b2;
      plan_dft *cld = (plan_dft *) ego->cld;
      plan_rdft2 *cldrest;
      UNUSED(r1); UNUSED(ci);
 
-     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2, cr += 2 * b2 * cv) {
-	  pack_r2hc(r0, B, n, rs, b2, ego->simd);
+     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2 * rv, cr += 2 * b2 * cv) {
+	  pack_r2hc(r0, B, n, rs, rv, b2, ego->simd);
 	  cld->apply((plan *) cld, B, B + 1, C, C + 1);
 	  post_r2hc(C, cr, n, cs, cv, b2);
      }
      if (ego->last) {
 	  cld = (plan_dft *) ego->cldlast;
-	  pack_r2hc(r0, B, n, rs, ego->last, ego->simd);
+	  pack_r2hc(r0, B, n, rs, rv, ego->last, ego->simd);
 	  cld->apply((plan *) cld, B, B + 1, C, C + 1);
 	  post_r2hc(C, cr, n, cs, cv, ego->last);
-	  r0 += 2 * ego->last; cr += 2 * ego->last * cv;
+	  r0 += 2 * ego->last * rv; cr += 2 * ego->last * cv;
      }
      VLEAVE();
      X(ifree)(B);
@@ -305998,23 +306182,23 @@ static void apply_r2hc(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
 static void apply_hc2r(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
 {
      const P *ego = (const P *) ego_;
-     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, cs = ego->cs, cv = ego->cv;
+     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, rv = ego->rv, cs = ego->cs, cv = ego->cv;
      R *B = (R *) MALLOC(sizeof(R) * 4 * n * b2, BUFFERS), *C = B + 2 * n * b2;
      plan_dft *cld = (plan_dft *) ego->cld;
      plan_rdft2 *cldrest;
      UNUSED(r1); UNUSED(ci);
 
-     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2, cr += 2 * b2 * cv) {
+     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2 * rv, cr += 2 * b2 * cv) {
 	  pre_hc2r(cr, B, n, cs, cv, b2);
 	  cld->apply((plan *) cld, B + 1, B, C + 1, C);
-	  unpack_hc2r(C, r0, n, rs, b2, ego->simd);
+	  unpack_hc2r(C, r0, n, rs, rv, b2, ego->simd);
      }
      if (ego->last) {
 	  cld = (plan_dft *) ego->cldlast;
 	  pre_hc2r(cr, B, n, cs, cv, ego->last);
 	  cld->apply((plan *) cld, B + 1, B, C + 1, C);
-	  unpack_hc2r(C, r0, n, rs, ego->last, ego->simd);
-	  r0 += 2 * ego->last; cr += 2 * ego->last * cv;
+	  unpack_hc2r(C, r0, n, rs, rv, ego->last, ego->simd);
+	  r0 += 2 * ego->last * rv; cr += 2 * ego->last * cv;
      }
      VLEAVE();
      X(ifree)(B);
@@ -306050,9 +306234,9 @@ static void print(const plan *ego_, printer *p)
 }
 
 static int applicable(const problem_rdft2 *p, const planner *plnr,
-		      INT *rs, INT *cs, INT *cv, INT *vl)
+		      INT *rs, INT *rv, INT *cs, INT *cv, INT *vl)
 {
-     INT rs2, rv;
+     INT rs2;
      if (!(1
 	   && !NO_SIMDP(plnr)
 	   && !NO_BUFFERINGP(plnr)
@@ -306064,12 +306248,13 @@ static int applicable(const problem_rdft2 *p, const planner *plnr,
 	   && p->ci == p->cr + 1))
 	  return 0;
      X(rdft2_strides)(p->kind, p->sz->dims, &rs2, cs);
-     X(rdft2_strides)(p->kind, p->vecsz->dims, &rv, cv);
+     X(rdft2_strides)(p->kind, p->vecsz->dims, rv, cv);
      *rs = rs2 / 2;
      *vl = p->vecsz->dims[0].n;
      return (1
-	     && rv == 1
 	     && rs2 == 2 * (p->r1 - p->r0)
+	     /* other strides with even n: FFTW's half-length hc2c path per transform is faster */
+	     && (*rv == 1 || (p->sz->dims[0].n % 2) == 1)
 	     && *vl >= 2 * VL
 	     && ALIGNED(p->cr)
 	     && SIMD_STRIDE_OK(*cs)
@@ -306092,13 +306277,13 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      P *pln;
      plan *cld = 0, *cldlast = 0, *cldrest = 0;
      R *B = 0;
-     INT n, rs, cs, cv, vl, npairs, b2, nblk, last, ncols;
+     INT n, rs, rv, cs, cv, vl, npairs, b2, nblk, last, ncols;
      static const plan_adt padt = {
 	  X(rdft2_solve), awake, print, destroy
      };
      UNUSED(ego_);
 
-     if (!applicable(p, plnr, &rs, &cs, &cv, &vl))
+     if (!applicable(p, plnr, &rs, &rv, &cs, &cv, &vl))
 	  return (plan *) 0;
 
      n = p->sz->dims[0].n;
@@ -306122,7 +306307,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      cldrest = X(mkplan_d)(plnr,
 			   X(mkproblem_rdft2_d)(X(tensor_copy)(p->sz),
 						X(mktensor_1d)(vl - ncols, p->vecsz->dims[0].is, p->vecsz->dims[0].os),
-						p->r0 + ncols, p->r1 + ncols,
+						p->r0 + ncols * rv, p->r1 + ncols * rv,
 						p->cr + ncols * cv, p->ci + ncols * cv,
 						p->kind));
      if (!cldrest) goto nada;
@@ -306136,10 +306321,11 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      pln->nblk = nblk;
      pln->last = last;
      pln->rs = rs;
+     pln->rv = rv;
      pln->cs = cs;
      pln->cv = cv;
      pln->ncols = ncols;
-     pln->simd = ALIGNED(p->r0) && SIMD_STRIDE_OK(rs);
+     pln->simd = rv == 1 && ALIGNED(p->r0) && SIMD_STRIDE_OK(rs);
 
      X(ops_zero)(&pln->super.super.ops);
      X(ops_madd2)(nblk, &cld->ops, &pln->super.super.ops);
@@ -306169,10 +306355,235 @@ static solver *mksolver(void)
 
 extern "C" void XSIMD(fftchode_rdft2_pair_register)(planner *p)
 {
-     REGISTER_SOLVER(p, mksolver());
+     if (fftchode_extra_solvers())
+	  REGISTER_SOLVER(p, mksolver());
 }
 }
 #undef FFTCHODE_PAIR_BUF_BYTES
+#pragma pop_macro("LD")
+#pragma pop_macro("ST")
+
+/* ==== fftchode/dft-colpack.c ==== */
+#pragma push_macro("LD")
+#pragma push_macro("ST")
+namespace f626_fftchode_dft_colpack {
+/*
+ * fftchode (FFTE-6, opt/simd): complex DFTs of adjacent columns (vector
+ * stride one complex on both sides, transform stride larger), as in the
+ * column pass of a 2-D/3-D transform or MATLAB fft(x,[],2).  Blocks of b
+ * columns (b a multiple of VL, sized for L2) are transposed with SIMD loads
+ * and stores into a buffer holding one contiguous transform per column,
+ * transformed by an ordinary contiguous vector DFT plan into a second buffer,
+ * and transposed back.  Compiled once per SIMD extension; fast mode only.
+ * In-place problems are fine: each block is read completely before it is
+ * written back.  Its benefit (cache-friendly contiguous transforms instead of
+ * strided ones) is invisible to the ESTIMATE operation count, so it is offered
+ * only to measuring planners (or a cost model that charges strided access).
+ */
+
+
+#define FFTCHODE_COLPACK_BUF_BYTES 262144
+
+typedef struct {
+     solver super;
+} S;
+
+typedef struct {
+     plan_dft super;
+     plan *cld, *cldlast, *cldrest;
+     INT n, b, nblk, last, is, os, ncols;
+     int bwd;
+} P;
+
+static void pack(const R *x, R *B, INT n, INT is, INT nb)
+{
+     INT f, c;
+     for (f = 0; f < n; ++f) {
+	  const R *xf = x + f * is;
+	  for (c = 0; c < nb; c += VL)
+	       ST(B + 2 * (c * n + f), LD(xf + 2 * c, 2, xf + 2 * c), 2 * n, B + 2 * f);
+     }
+}
+
+static void unpack(const R *C, R *y, INT n, INT os, INT nb)
+{
+     INT f, c;
+     for (f = 0; f < n; ++f) {
+	  R *yf = y + f * os;
+	  for (c = 0; c < nb; c += VL)
+	       ST(yf + 2 * c, LD(C + 2 * (c * n + f), 2 * n, C + 2 * f), 2, yf + 2 * c);
+     }
+}
+
+static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
+{
+     const P *ego = (const P *) ego_;
+     INT k, n = ego->n, b = ego->b, is = ego->is, os = ego->os, s = ego->bwd;
+     R *x = s ? ii : ri, *y = s ? io : ro;
+     R *B = (R *) MALLOC(sizeof(R) * 4 * n * b, BUFFERS), *C = B + 2 * n * b;
+     plan_dft *cld = (plan_dft *) ego->cld;
+     plan_dft *cldrest;
+
+     for (k = 0; k < ego->nblk; ++k, x += 2 * b, y += 2 * b) {
+	  pack(x, B, n, is, b);
+	  cld->apply((plan *) cld, B + s, B + 1 - s, C + s, C + 1 - s);
+	  unpack(C, y, n, os, b);
+     }
+     if (ego->last) {
+	  cld = (plan_dft *) ego->cldlast;
+	  pack(x, B, n, is, ego->last);
+	  cld->apply((plan *) cld, B + s, B + 1 - s, C + s, C + 1 - s);
+	  unpack(C, y, n, os, ego->last);
+	  x += 2 * ego->last; y += 2 * ego->last;
+     }
+     VLEAVE();
+     X(ifree)(B);
+
+     cldrest = (plan_dft *) ego->cldrest;
+     cldrest->apply((plan *) cldrest, x + s, x + 1 - s, y + s, y + 1 - s);
+}
+
+static void awake(plan *ego_, enum wakefulness wakefulness)
+{
+     P *ego = (P *) ego_;
+     X(plan_awake)(ego->cld, wakefulness);
+     X(plan_awake)(ego->cldlast, wakefulness);
+     X(plan_awake)(ego->cldrest, wakefulness);
+}
+
+static void destroy(plan *ego_)
+{
+     P *ego = (P *) ego_;
+     X(plan_destroy_internal)(ego->cldrest);
+     X(plan_destroy_internal)(ego->cldlast);
+     X(plan_destroy_internal)(ego->cld);
+}
+
+static void print(const plan *ego_, printer *p)
+{
+     const P *ego = (const P *) ego_;
+     p->print(p, "(%s-%D-x%D/%D%(%p%)%(%p%)%(%p%))",
+	      XSIMD_STRING("dft-colpack"), ego->n, ego->ncols, ego->b,
+	      ego->cld, ego->cldlast, ego->cldrest);
+}
+
+static plan *mkcld(planner *plnr, INT n, INT nb, R *B, R *C, int s)
+{
+     return X(mkplan_d)(plnr,
+			X(mkproblem_dft_d)(X(mktensor_1d)(n, 2, 2),
+					   X(mktensor_1d)(nb, 2 * n, 2 * n),
+					   B + s, B + 1 - s, C + s, C + 1 - s));
+}
+
+static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
+{
+     const problem_dft *p = (const problem_dft *) p_;
+     P *pln;
+     plan *cld = 0, *cldlast = 0, *cldrest = 0;
+     R *B = 0, *x, *y;
+     INT n, is, os, vl, ncols, b, nblk, last;
+     int s;
+     static const plan_adt padt = {
+	  X(dft_solve), awake, print, destroy
+     };
+     UNUSED(ego_);
+
+     if (!(1
+	   && !ESTIMATEP(plnr)
+	   && !NO_SIMDP(plnr)
+	   && !NO_BUFFERINGP(plnr)
+	   && p->sz->rnk == 1
+	   && p->vecsz->rnk == 1
+	   && p->sz->dims[0].n >= 2
+	   && p->vecsz->dims[0].is == 2
+	   && p->vecsz->dims[0].os == 2
+	   && p->vecsz->dims[0].n >= VL))
+	  return (plan *) 0;
+     if (p->ii == p->ri + 1 && p->io == p->ro + 1)
+	  s = 0;
+     else if (p->ri == p->ii + 1 && p->ro == p->io + 1)
+	  s = 1;
+     else
+	  return (plan *) 0;
+     x = s ? p->ii : p->ri;
+     y = s ? p->io : p->ro;
+     n = p->sz->dims[0].n;
+     is = p->sz->dims[0].is;
+     os = p->sz->dims[0].os;
+     vl = p->vecsz->dims[0].n;
+     if (!(1
+	   && X(iabs)(is) > 2 && X(iabs)(os) > 2
+	   && ALIGNED(x) && ALIGNED(y)
+	   && SIMD_STRIDE_OK(is) && SIMD_STRIDE_OK(os)))
+	  return (plan *) 0;
+
+     ncols = (vl / VL) * VL;
+     b = (FFTCHODE_COLPACK_BUF_BYTES / (INT)(2 * sizeof(R) * n)) / VL * VL;
+     if (b < VL) b = VL;
+     if (b > ncols) b = ncols;
+     nblk = ncols / b;
+     last = ncols - nblk * b;
+
+     B = (R *) MALLOC(sizeof(R) * 4 * n * b, BUFFERS);
+     cld = mkcld(plnr, n, b, B, B + 2 * n * b, s);
+     if (!cld) goto nada;
+     if (last) {
+	  cldlast = mkcld(plnr, n, last, B, B + 2 * n * b, s);
+	  if (!cldlast) goto nada;
+     }
+     X(ifree)(B); B = 0;
+
+     cldrest = X(mkplan_d)(plnr,
+			   X(mkproblem_dft_d)(X(tensor_copy)(p->sz),
+					      X(mktensor_1d)(vl - ncols, 2, 2),
+					      p->ri + 2 * ncols, p->ii + 2 * ncols,
+					      p->ro + 2 * ncols, p->io + 2 * ncols));
+     if (!cldrest) goto nada;
+
+     pln = MKPLAN_DFT(P, &padt, apply);
+     pln->cld = cld;
+     pln->cldlast = cldlast;
+     pln->cldrest = cldrest;
+     pln->n = n;
+     pln->b = b;
+     pln->nblk = nblk;
+     pln->last = last;
+     pln->is = is;
+     pln->os = os;
+     pln->ncols = ncols;
+     pln->bwd = s;
+
+     X(ops_zero)(&pln->super.super.ops);
+     X(ops_madd2)(nblk, &cld->ops, &pln->super.super.ops);
+     if (cldlast)
+	  X(ops_add2)(&cldlast->ops, &pln->super.super.ops);
+     X(ops_add2)(&cldrest->ops, &pln->super.super.ops);
+     /* per VL columns and point: a load and a store in each direction */
+     pln->super.super.ops.other += (double)(ncols / VL) * n * 4;
+     return &(pln->super.super);
+
+ nada:
+     X(ifree0)(B);
+     X(plan_destroy_internal)(cldrest);
+     X(plan_destroy_internal)(cldlast);
+     X(plan_destroy_internal)(cld);
+     return (plan *) 0;
+}
+
+static solver *mksolver(void)
+{
+     static const solver_adt sadt = { PROBLEM_DFT, mkplan, 0 };
+     S *slv = MKSOLVER(S, &sadt);
+     return &(slv->super);
+}
+
+extern "C" void XSIMD(fftchode_dft_colpack_register)(planner *p)
+{
+     if (fftchode_extra_solvers())
+	  REGISTER_SOLVER(p, mksolver());
+}
+}
+#undef FFTCHODE_COLPACK_BUF_BYTES
 #pragma pop_macro("LD")
 #pragma pop_macro("ST")
 }}
