@@ -473878,6 +473878,8 @@ extern "C" void X(spawn_loop)(int loopmax, int nthreads,
 		   spawn_function proc, void *data);
 extern "C" void X(spawn_loop_work)(int loopmax, int nthreads,
 		   spawn_function proc, void *data, double work);
+extern "C" void X(spawn_loop_vrank)(int nthr, spawn_function proc, void *data,
+		   double work, INT ots_bytes, int cldnthr);
 extern "C" double X(spawn_work)(plan **plns, int n);
 extern "C" int X(ithreads_init)(void);
 extern "C" void X(threads_cleanup)(void);
@@ -474365,6 +474367,7 @@ typedef struct {
      INT its, ots;
      int nthr;
      const S *solver;
+     int cldnthr; /* threads each block may use itself */
 } P;
 
 typedef struct {
@@ -474397,11 +474400,9 @@ static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
      d.cldrn = ego->cldrn;
      d.ri = ri; d.ii = ii; d.ro = ro; d.io = io;
 
-     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
-			   /* blocks whose outputs start less than a cache line apart share
-			      lines (false sharing): run them on the caller */
-			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
-			   X(spawn_work)(ego->cldrn, ego->nthr));
+     X(spawn_loop_vrank)(ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr),
+			   X(iabs)(ego->ots) * (INT)sizeof(R), ego->cldnthr);
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
@@ -474517,6 +474518,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      pln->its = its;
      pln->ots = ots;
      pln->nthr = nthr;
+     pln->cldnthr = plnr->nthr;
 
      pln->solver = ego;
      X(ops_zero)(&pln->super.super.ops);
@@ -475233,6 +475235,7 @@ typedef struct {
      INT its, ots;
      int nthr;
      const S *solver;
+     int cldnthr; /* threads each block may use itself */
 } P;
 
 typedef struct {
@@ -475262,11 +475265,9 @@ static void apply(const plan *ego_, R *I, R *O)
      d.cldrn = ego->cldrn;
      d.I = I; d.O = O;
 
-     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
-			   /* blocks whose outputs start less than a cache line apart share
-			      lines (false sharing): run them on the caller */
-			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
-			   X(spawn_work)(ego->cldrn, ego->nthr));
+     X(spawn_loop_vrank)(ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr),
+			   X(iabs)(ego->ots) * (INT)sizeof(R), ego->cldnthr);
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
@@ -475382,6 +475383,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      pln->its = its;
      pln->ots = ots;
      pln->nthr = nthr;
+     pln->cldnthr = plnr->nthr;
 
      pln->solver = ego;
      X(ops_zero)(&pln->super.super.ops);
@@ -475982,8 +475984,8 @@ extern "C" double X(spawn_work)(plan **plns, int n)
    would get less than min_work of them.
 
    This function returns only after all the blocks have completed. */
-extern "C" void X(spawn_loop_work)(int loopmax, int nthr, spawn_function proc, void *data,
-				   double work)
+static void spawn_loop_lanes(int loopmax, int nthr, spawn_function proc, void *data,
+			     double work, int maxlanes)
 {
      int block_size, nlanes;
      int i;
@@ -476022,6 +476024,8 @@ extern "C" void X(spawn_loop_work)(int loopmax, int nthr, spawn_function proc, v
      nlanes = nthr;
      if (work < min_work * nthr)
 	  nlanes = work < 2 * min_work ? 1 : (int)(work / min_work);
+     if (nlanes > maxlanes)
+	  nlanes = maxlanes;
      nlanes = 1 + (nlanes > 1 ? take_lanes(nlanes - 1) : 0);
 
      if (nlanes <= 1) {
@@ -476081,6 +476085,32 @@ extern "C" void X(spawn_loop_work)(int loopmax, int nthr, spawn_function proc, v
      }
      STACK_FREE(sdata);
 }
+
+extern "C" void X(spawn_loop_work)(int loopmax, int nthr, spawn_function proc, void *data,
+				   double work)
+{
+     spawn_loop_lanes(loopmax, nthr, proc, data, work, nthr);
+}
+
+/* Threaded vrank>=1 loops: block i starts i * ots_bytes into the output, so
+   blocks less than a cache line apart write the same lines (false sharing).
+   Such a loop runs on the caller when its blocks have threads of their own
+   (a few long columns, as in a 6 x 2000 matrix along dimension 2: the column
+   transforms are threaded inside) or when it is short.  A long loop of
+   single-threaded blocks, such as the 16 interleaved sub-transforms of a
+   large 1-d c2r, still pays for its false sharing with parallel speedup and
+   is spread as usual. */
+#define FALSE_SHARING_MAX_WORK 1e6
+
+extern "C" void X(spawn_loop_vrank)(int nthr, spawn_function proc, void *data,
+				    double work, INT ots_bytes, int cldnthr)
+{
+     int maxlanes = nthr;
+     if (ots_bytes < 64 && (cldnthr > 1 || work < FALSE_SHARING_MAX_WORK))
+	  maxlanes = 1;
+     spawn_loop_lanes(nthr, nthr, proc, data, work, maxlanes);
+}
+#undef FALSE_SHARING_MAX_WORK
 
 extern "C" void X(spawn_loop)(int loopmax, int nthr, spawn_function proc, void *data)
 {
@@ -476172,6 +476202,7 @@ typedef struct {
      INT its, ots;
      int nthr;
      const S *solver;
+     int cldnthr; /* threads each block may use itself */
 } P;
 
 typedef struct {
@@ -476204,11 +476235,9 @@ static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
      d.cldrn = ego->cldrn;
      d.r0 = r0; d.r1 = r1; d.cr = cr; d.ci = ci;
 
-     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
-			   /* blocks whose outputs start less than a cache line apart share
-			      lines (false sharing): run them on the caller */
-			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
-			   X(spawn_work)(ego->cldrn, ego->nthr));
+     X(spawn_loop_vrank)(ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr),
+			   X(iabs)(ego->ots) * (INT)sizeof(R), ego->cldnthr);
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
@@ -476331,6 +476360,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      pln->its = its;
      pln->ots = ots;
      pln->nthr = nthr;
+     pln->cldnthr = plnr->nthr;
 
      pln->solver = ego;
      X(ops_zero)(&pln->super.super.ops);
