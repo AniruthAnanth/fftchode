@@ -1,161 +1,186 @@
-\documentclass{article}
-\usepackage{amsmath,amssymb}
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
 \usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
 \emergencystretch=3em
-\title{fftchode: a faster, still bit-exact FFTW~3.3.10 in one C++ file}
-\date{November 2026}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+
+\newcommand{\pending}[1]{\par\noindent\fbox{\parbox{0.97\linewidth}{\small\textcolor{red}{\textbf{Pending audited numbers:}} #1}}\par}
+
+\title{fftchode: Bit-Identical and Calibrated-Fast Variants of FFTW~3.3.10\\in a Single C++ Translation Unit}
+\author{}
+\date{}
+
 \begin{document}
 \maketitle
 
 \begin{abstract}
-fftchode is FFTW~3.3.10, configured as MATLAB R2026b uses it, rebuilt as a single C++ translation unit with an FFTW~3-compatible API. It has two numerics modes. \emph{Baseline} mode returns results that are bit-identical to scalar FFTW~3.3.10 built without FMA contraction, and on an AMD Zen~4 machine it is $1.143\times$ faster than that build at one thread and $2.88\times$ faster at eight. \emph{Fast} mode adds SIMD codelets, three new solvers and a cost-model planner. It is $2.67\times$ faster at one thread and $6.42\times$ at eight, with error equal to or slightly below FFTW's. Gains on a held-out set of 78 unseen problems are within the confidence intervals or larger. This note describes the algorithm, each change, and the measurements.
+Scientific software that relies on the discrete Fourier transform often needs two things at once: results that are reproducible bit for bit against an established reference, and throughput close to what modern CPUs allow. We describe fftchode, a derivative of FFTW~3.3.10 that keeps FFTW's API, algorithms and planner architecture and adds two numerics modes. In \emph{baseline} mode every output is bit-identical to scalar FFTW~3.3.10 planned with \texttt{FFTW\_ESTIMATE} and compiled without FMA contraction, the configuration MATLAB R2026b ships. Its speedups come only from changes that preserve the exact sequence of floating-point operations: per-ISA compilation of FFTW's scalar codelets, column buffering for cache-aliasing strides, and a lower-overhead thread pool. In \emph{fast} mode fftchode adds FFTW's own SIMD codelets with runtime dispatch, three solvers, and a deterministic cost-model planner whose weights are fitted by non-negative least squares and whose search is bounded by a plan count. We evaluate on a frozen 128-problem suite and a 78-problem held-out suite on one AMD Zen~4 machine.
+\pending{headline speedups for both modes at 1 and 8 threads, planner quality relative to measured planning, per-cell ratio to the fastest library, and the single-machine caveat.}
 \end{abstract}
 
-\section{Background}
+\section{Introduction}
 
-\subsection{The transform}
-For $x\in\mathbb{C}^n$ the forward and backward DFTs are
-\[
-X_k=\sum_{j=0}^{n-1}x_j\,\omega_n^{\pm jk},\qquad \omega_n=e^{-2\pi i/n}.
-\]
-Neither is normalized. A multi-dimensional transform applies the 1-D transform along each axis, and a batched (\emph{howmany}) transform applies it to many arrays at fixed strides. Real input $x\in\mathbb{R}^n$ has Hermitian output, $X_{n-k}=\overline{X_k}$, so only the $\lfloor n/2\rfloor+1$ non-redundant outputs are stored (r2c); c2r is the inverse map.
+The fast Fourier transform is a building block of numerical computing, and on CPUs the FFTW library~\cite{frigo2005fftw3} has served for two decades as both a fast implementation and a de facto reference. Many applications pin a particular FFTW build because downstream results, test baselines or archived outputs depend on its exact output bits. Such a build is often conservative: scalar codelets, no fused multiply--add (FMA) contraction, and the non-measuring \texttt{FFTW\_ESTIMATE} planner, whose plans depend only on the problem and not on timing noise. MATLAB R2026b, for instance, ships FFTW~3.3.10 in this configuration (scalar build, \texttt{FFTW\_ESTIMATE} planning, FMA contraction off), checkable with \texttt{version('-fftw')}~\cite{matlabfft}. That configuration leaves much of the hardware unused, but the usual remedies (SIMD codelets, measured planning, vendor libraries) change the output bits, make the plan depend on timing, or both.
 
-\subsection{FFTW 3.3.10 as MATLAB configures it}
-FFTW describes a problem by two tensors of (length, input stride, output stride) triples: the transform dimensions and the loop (vector) dimensions. A \emph{planner} breaks the problem down recursively, and each step is taken by a \emph{solver}. The leaves are \emph{codelets}: straight-line code generated for small sizes, in which multiplications by $\pm1$ and $\pm i$ are removed, common subexpressions are shared, and constants are exact decimal expansions of $\cos$ and $\sin$.
+This paper asks how much of that performance can be recovered in two settings: first without changing a single output bit, and second when rounding-level differences are acceptable but plans must stay deterministic. Our contributions are specific and modest:
+\begin{enumerate}
+\item A \emph{bit-identical} mode for FFTW~3.3.10 that speeds up execution with three transformations that keep the floating-point operation sequence: per-ISA register-allocation specialization of the scalar codelets, column buffering of cache-aliasing strided loops under a plan-structure equality check, and a thread pool whose lane count depends on the work while the block decomposition stays fixed (Section~\ref{sec:method}).
+\item A \emph{fast} mode in which FFTW's ESTIMATE heuristic is replaced by a linear cost model over 36 plan features, calibrated once on a training set disjoint from the evaluation suites, with a count-based search budget so that plans remain a deterministic function of the problem.
+\item An evaluation protocol for FFT libraries on a shared machine: a frozen suite fixed before optimization, a held-out suite committed by hash before tuning, interleaved timing with paired-bootstrap confidence intervals, separate planning and execution timing, error against a long-double reference, and peak-heap accounting. All per-case results are released as CSV files.
+\end{enumerate}
+fftchode is FFTW: the codelet generator output, solvers, planner and API are those of FFTW~3.3.10~\cite{frigo2005fftw3,fftw3310}, distributed as one C++ translation unit with an FFTW~3-compatible header. We do not claim new FFT algorithms, and we do not claim that fftchode is the fastest FFT library. All results come from one machine (Section~\ref{sec:results}).
 
-The solver families reached are:
+\section{Background}\label{sec:background}
+
+\subsection{The discrete Fourier transform}
+For $x\in\mathbb{C}^n$ the unnormalized forward and backward DFTs are
+\begin{equation}
+X_k=\sum_{j=0}^{n-1}x_j\,\omega_n^{\pm jk},\qquad \omega_n=e^{-2\pi i/n},\qquad 0\le k<n .
+\end{equation}
+A multi-dimensional transform applies the 1-D transform along each axis, and a batched transform applies it to many arrays at fixed strides. Real input has Hermitian output, $X_{n-k}=\overline{X_k}$, so a real-to-complex (r2c) transform stores the $\lfloor n/2\rfloor+1$ non-redundant outputs, and complex-to-real (c2r) is its inverse. Fast algorithms factor the dense $O(n^2)$ map. For $n=rm$ the Cooley--Tukey step~\cite{cooley1965,vanloan1992}, with $j=j_1+mj_2$ and $k=k_2+rk_1$, is
+\begin{equation}\label{eq:ct}
+X_{k_2+rk_1}=\sum_{j_1=0}^{m-1}\Big[\omega_n^{j_1k_2}\sum_{j_2=0}^{r-1}x_{j_1+mj_2}\,\omega_r^{j_2k_2}\Big]\omega_m^{j_1k_1},
+\end{equation}
+that is, $m$ DFTs of size $r$, a twiddle multiplication, and $r$ DFTs of size $m$. Split-radix variants lower the operation count further~\cite{duhamel1984splitradix,johnson2007splitradix}. Prime sizes need a different reduction: Rader's algorithm~\cite{rader1968} maps a DFT of prime size $p$ to a cyclic convolution of length $p-1$ through a generator of $(\mathbb{Z}/p)^\times$, and Bluestein's chirp-$z$ algorithm~\cite{bluestein1970} uses $jk=\tfrac12\big(j^2+k^2-(k-j)^2\big)$ to write any DFT as a convolution, computed with zero-padded FFTs of a smooth length $n_b\ge 2n-1$. The FFT is accurate in floating point, with relative rms error growing as $O(\varepsilon\sqrt{\log n})$ when twiddle factors are computed accurately~\cite{schatzman1996}.
+
+\subsection{FFTW's architecture}
+FFTW~3~\cite{frigo2005fftw3} separates \emph{what} to compute from \emph{how}. A \emph{problem} is described by two tensors of (length, input stride, output stride) triples: the transform dimensions and the vector (loop) dimensions. A \emph{solver} either solves a problem directly or reduces it to smaller problems; the \emph{planner} applies solvers recursively and keeps the cheapest resulting \emph{plan}. The leaves are \emph{codelets}: straight-line code for small sizes (2--16, 20, 25, 32 and 64 points, plus twiddle variants) produced by the \texttt{genfft} generator~\cite{frigo1999genfft}, which removes multiplications by $\pm1$ and $\pm i$, shares common subexpressions and schedules the result for register pressure. The solver families include Cooley--Tukey in decimation-in-time and decimation-in-frequency forms with buffered variants; generic $O(p^2)$ code for small odd primes; Rader and Bluestein for larger primes; the \emph{rdft2} family for real data (direct r2c codelets, a real Cooley--Tukey step whose \texttt{hc2c} codelets combine halfcomplex sub-results, and halfcomplex transforms followed by a copy); and rank and vector-rank reductions plus indirect and transpose solvers for multi-dimensional and in-place problems.
+
+The planner has several modes. \texttt{FFTW\_ESTIMATE} times nothing: a plan's cost is its operation count, $\mathrm{add}+\mathrm{mul}+2\,\mathrm{fma}+\mathrm{other}$, and impatience flags prune the search. Its plan, and with it the exact sequence of floating-point operations, depends only on the problem, the flags and the thread count. \texttt{FFTW\_MEASURE} and \texttt{FFTW\_PATIENT} time candidate plans and keep the fastest. They find better plans at a planning cost of milliseconds to minutes, and they make the plan, and so the output bits, depend on timing noise unless the plan is fixed through exported \emph{wisdom}. With $T>1$ threads, threaded solvers split the outermost vector loop, or the butterfly columns of a Cooley--Tukey step, into blocks that run on a thread pool; the arithmetic within each block is that of the serial code. FFTW's SIMD codelets come from the same generator as the scalar ones but evaluate operations in a different order and, on FMA-capable targets, fuse multiply--adds, so their output differs from the scalar build's at rounding level.
+
+\subsection{Related libraries}
+SPIRAL~\cite{puschel2005spiral} generates transform code from a formula language and searches over breakdown rules at generation time, a counterpart to FFTW's run-time planner. AMD's AOCL-FFTW~\cite{aoclfftw} is a derivative of FFTW~3.3.10 tuned for AMD processors, including an application-optimization mode with its own search. Intel oneMKL~\cite{onemkl} provides closed-source DFT routines with an FFTW-compatible wrapper. pocketfft~\cite{pocketfft} and its successor in ducc0~\cite{ducc0} are header-only C++ libraries without run-time planning, used in NumPy and SciPy. PFFFT~\cite{pffft} is a compact SIMD library restricted to lengths of the form $2^a3^b5^c$ above a minimum size. KissFFT~\cite{kissfft} favours simplicity, and FFTE~\cite{ffte} targets large transforms. For reproducibility, Demmel and Nguyen~\cite{demmel2013reproducible} make summations independent of evaluation order; fftchode instead fixes the order, which is possible because an FFT has no data-dependent reductions across threads.
+
+\section{Methodology}\label{sec:method}
+
+\subsection{Numerics modes}\label{sec:modes}
+
+fftchode has one process-wide switch, set by \texttt{fftchode\_set\_numerics(m)} before the first plan or by the environment variable \texttt{FFTCHODE\_NUMERICS}. Each mode has its own planner and wisdom. Let $\mathcal{R}$ denote the reference: FFTW~3.3.10 built from the release tarball with its scalar codelets, compiled with \texttt{-O2 -ffp-contract=off} by the same compiler and linked against the same C library. Let $p$ be a guru64 problem (kind, sign, precision, transform and vector tensors, placement), $f$ the planner flags and $T$ the thread count.
+
+\begin{definition}[Baseline mode]\label{def:baseline}
+For every $p$, $f$ and $T$, baseline mode builds the same plan as $\mathcal{R}$ given the same wisdom, exports the same wisdom, and executes the same sequence of IEEE~754 operations~\cite{ieee754} on the same operands. Hence for every input $x$ its output equals $\mathcal{R}$'s bit for bit, except for the payload of NaN results computed from NaN inputs, which IEEE~754 leaves unspecified.
+\end{definition}
+
+Under \texttt{FFTW\_ESTIMATE} the plan is a function of $(p,f,T)$ alone, so baseline-mode output is reproducible across runs and across x86-64 CPUs, provided the C library returns the same $\cos$ and $\sin$ values: twiddle factors are computed in double precision at plan time, and these calls are the only platform-dependent arithmetic. Under measuring flags the guarantee holds plan for plan. Every change in Sections~\ref{sec:mv}--\ref{sec:threads} applies in both modes and is admitted only if it preserves Definition~\ref{def:baseline}. Three checks enforce it: (i) an upstream battery of 4020 problems compares output bytes and exported wisdom against $\mathcal{R}$ built from the checksummed tarball (\texttt{make test-upstream}); (ii) 64-bit output hashes of the frozen suite match $\mathcal{R}$'s at 1 and 8 threads; and (iii) the same comparison passes under CPU emulation of an AVX2-only and a pre-AVX x86-64 processor, which exercises the dispatch paths.
+
+\begin{definition}[Fast mode]\label{def:fast}
+Fast mode may change the operation sequence. Its outputs must agree with baseline mode within a rounding-level tolerance (5616 transforms in \texttt{make test-fast}), and its error against a long-double reference is reported next to baseline mode's. Under \texttt{FFTW\_ESTIMATE} its plan is a deterministic function of $(p,f,T)$, the detected instruction-set level, and the number of CPUs in the process affinity mask. Fast mode makes no bitwise promise across machines with different instruction sets.
+\end{definition}
+
+\subsection{Per-ISA specialization of scalar codelets (both modes)}\label{sec:mv}
+
+A scalar codelet is a straight-line sequence of IEEE additions, subtractions and multiplications. Its result depends only on the order of those operations, not on the registers or instruction encodings that carry them, as long as the compiler neither contracts multiply--adds nor reassociates. fftchode compiles every scalar codelet three times from the same source, for generic x86-64, AVX2 and AVX-512, using per-function \texttt{target} attributes with FMA contraction disabled. The AVX-512 copy still performs scalar operations, but the EVEX encoding gives it 32 vector registers instead of 16, which removes most register spills in the large codelets: the double-precision 64-point codelet shrinks from 2761 to 1873 instructions. The planner binds each codelet to the copy for the running CPU.
+
+One exception is made for locality. When the rows a codelet touches fall at least eight times on each L1 set they use ($\text{rows}/\text{distinct sets}\ge8$, as with large power-of-two strides), the AVX-512 copy's load schedule is slower, so the plan keeps the generic copy. All three copies produce identical bits, so the choice affects speed only.
+
+\subsection{Column buffering for L1-aliasing strides (both modes)}\label{sec:colbuf}
+
+MATLAB-style transforms along a non-leading dimension, and the column passes of 2-D and 3-D transforms, are vector loops of $v$ transforms of length $n$ at element stride $s$, with adjacent transforms one element apart. Each transform touches one cache line per element. In a 32~KiB, 8-way L1 with 64-byte lines, a column with byte stride $\sigma$ can occupy at most
+\begin{equation}
+\lambda(\sigma)=8\cdot\frac{4096}{\max\big(\gcd(4096,\sigma),\,64\big)}
+\end{equation}
+lines. A power-of-two $\sigma\ge4096$ gives $\lambda=8$, so for $n>8$ every pass of the transform after the first misses in L1. fftchode replaces such a loop by Algorithm~\ref{alg:colbuf} when the column spans at least 256~KiB, $\lambda(\sigma)<512$ and $n>\lambda(\sigma)$. It copies $b$ adjacent columns, one cache line wide ($b=4$ complex doubles or 8 complex floats; the real-data variant uses one line of reals), into a contiguous buffer of at most 256~KiB, transforms them there with a \emph{shadow} child plan, and copies the result back.
+
+\begin{algorithm}[t]
+\caption{Column-buffered vector loop (strided child plan $c$, shadow plan $c'$)}\label{alg:colbuf}
+\begin{algorithmic}[1]
+\For{$q=0,b,2b,\dots$ \textbf{while} $q+b\le v$}
+  \State copy columns $q,\dots,q+b-1$ (element stride $s$) into buffer $B$, one column every $d$ elements
+  \State apply $c'$ to the $b$ contiguous columns of $B$
+  \State copy the $b$ result columns back to the output at stride $s$
+\EndFor
+\State apply $c$ to the remaining $v \bmod b$ columns in place
+\end{algorithmic}
+\end{algorithm}
+
+Copies are exact, so the output bits depend only on the arithmetic of $c'$. FFTW's ESTIMATE planner may choose a different solver tree for the contiguous problem than for the strided one. In baseline mode the shadow is therefore kept only if its printed plan structure, with stride and copy annotations removed, equals that of the strided child $c$; otherwise the loop runs unbuffered. Identical structure implies identical arithmetic, so Definition~\ref{def:baseline} holds. In fast mode any shadow is accepted, and the cost model (Section~\ref{sec:planner}) prices the buffered loop as it executes.
+
+\paragraph{Memory of shadow planning.} An earlier version planned the shadow on freshly allocated full-size scratch arrays and freed them afterwards. This raised peak heap without changing speed or bits: for a $128^3$ double-precision c2c problem the peak was 67~MB instead of 0.6~MB. The shadow is now planned on the plan's own strided array plus only the contiguous buffer, so column buffering adds no peak memory beyond that buffer (636{,}552 bytes for the same problem). A speed check against the version before the fix gave $1.020\times$ (95\% CI 0.998--1.031) at one thread and $1.008\times$ (0.987--1.048) at eight, i.e.\ no measurable effect. Since neither speed nor bit-identity checks caught the problem, peak heap is a separate gate in our evaluation.
+
+\subsection{Thread pool with work-based lane count (both modes)}\label{sec:threads}
+
+FFTW's pool wakes a worker through a semaphore at every hand-off, which costs tens of microseconds per parallel region on a virtualized host. fftchode keeps FFTW's threaded solvers and their block decomposition and replaces only the pool. Work is handed over through an atomic slot; idle workers spin for up to $100\,\mu$s before sleeping, the caller spins for up to 1~ms while joining, and lane $j$ is always served by the same worker. For a parallel region with $W=\mathrm{add}+\mathrm{mul}+2\,\mathrm{fma}+\mathrm{other}$ operations and $T$ available CPUs, the number of lanes is
+\begin{equation}\label{eq:lanes}
+L(W,T)=\begin{cases}T, & W\ge mT,\\ 1, & W<2m,\\ \lfloor W/m\rfloor, & \text{otherwise},\end{cases}\qquad m=16384,
+\end{equation}
+further capped by the number of blocks; nested regions share one lane budget equal to the CPU count. The blocks are distributed over the $L$ lanes, and each block runs the same child plan on the same data as in FFTW. A region whose blocks write interleaved outputs within one cache line runs entirely on the caller unless its blocks are themselves threaded or $W\ge10^6$, which avoids false sharing on small loops without serializing large ones. An FFT has no reductions across blocks, so the assignment of blocks to lanes cannot change any output bit.
+
+\subsection{SIMD codelets with runtime dispatch (fast mode)}\label{sec:simd}
+
+Fast mode registers FFTW~3.3.10's own SIMD codelets for SSE2, AVX, AVX2 (with FMA), 128-bit AVX2 and AVX-512 on x86-64, and NEON on AArch64. Each family is compiled under a function-level target attribute, so the translation unit needs no \texttt{-m} flags, and it is registered with the planner only if CPUID reports the instruction set; environment variables can cap the level for testing. fftchode adds three solvers:
 \begin{itemize}
-\item \textbf{Cooley--Tukey.} For $n=rm$, with $j=j_1+mj_2$ and $k=k_2+rk_1$,
-\[
-X_{k_2+rk_1}=\sum_{j_1=0}^{m-1}\Big[\omega_n^{j_1k_2}\sum_{j_2=0}^{r-1}x_{j_1+mj_2}\,\omega_r^{j_2k_2}\Big]\omega_m^{j_1k_1}.
-\]
-A radix-$r$ twiddle codelet ($t1$, $t2$) performs the $m$ butterflies, and the size-$m$ children are planned recursively, in decimation-in-time or decimation-in-frequency order. Leaves are $n1$ codelets of size 2--16, 20, 25, 32 and 64. Buffered variants copy strided data through contiguous scratch.
-\item \textbf{Primes.} Odd primes $16<p<173$ use an $O(p^2)$ generic solver. Rader's algorithm turns a prime $p$ into a cyclic convolution of length $p-1$ through a generator of $(\mathbb{Z}/p)^\times$. Under ESTIMATE it is used only for $p>32$ when $p-1$ factors into 2, 3 and 5. All other primes use Bluestein's chirp-$z$ form, $jk=\tfrac12\big(j^2+k^2-(k-j)^2\big)$, zero-padded to a 2-3-5-smooth length $n_b\ge 2n-1$.
-\item \textbf{Real data.} r2c and c2r go through \emph{rdft2}: direct $r2cf$/$r2cb$ codelets for small sizes; a real Cooley--Tukey step whose $hc2c$ twiddle codelets combine halfcomplex sub-results into complex outputs; or a halfcomplex R2HC transform followed by a copy. Halfcomplex storage $r_0,\dots,r_{n/2},i_{(n+1)/2-1},\dots,i_1$ needs no extra memory. Real primes go through the Hartley transform and Rader on it.
-\item \textbf{Multi-dimensional and batched.} Rank-$k$ problems are split row--column into lower ranks, vector loops are peeled one dimension at a time (\emph{vrank-geq1}), and indirect and transpose solvers handle in-place layouts. MATLAB calls the guru64 interface, out of place, with a strided 1-D transform for \texttt{fft(x,[],d)} and one 1-D pass per dimension for \texttt{fft2}/\texttt{fftn}.
+\item \emph{rdft2-pair} computes two real transforms of $x,y\in\mathbb{R}^n$ as one complex DFT $Z$ of $z=x+iy$ and separates them by
+$X_k=\tfrac12\big(Z_k+\overline{Z_{n-k}}\big)$ and $Y_k=\tfrac{1}{2i}\big(Z_k-\overline{Z_{n-k}}\big)$. It serves real columns and odd-length batches, where FFTW's real codelets are scalar.
+\item \emph{rdft2-embed} computes an odd-length real transform as the complex DFT of $x+0i$, so that Rader and Bluestein run in SIMD.
+\item \emph{dft-colpack} transposes adjacent complex columns into contiguous scratch with SIMD shuffles; only the measuring planners use it.
+\end{itemize}
+In fast mode Bluestein's algorithm stores half of the chirp, using $w_{n_b-k}=-w_k$, and half of its transform, which is even.
+
+\subsection{Deterministic calibrated cost-model planner (fast mode)}\label{sec:planner}
+
+With SIMD codelets the operation count predicts run time poorly: it ignores vector width, memory traffic, cache conflicts and call overhead, and it often prefers plans whose loops cannot be vectorized. Fast mode keeps FFTW's planner and solver set but changes the search and the cost.
+
+\paragraph{Search.} Stock ESTIMATE stops exploring a problem at the first plan its impatience heuristics accept. Fast mode evaluates every applicable solver until a top-level plan has evaluated $B=10^4$ plans; after that, the rest of the search prunes exactly as stock ESTIMATE does. The budget is a count, not a time, so the chosen plan does not depend on machine load, and it bounds the search on highly composite sizes such as $720720=2^4\cdot3^2\cdot5\cdot7\cdot11\cdot13$.
+
+\paragraph{Cost.} A plan $\pi$ is ranked by $c(\pi)=w^\top\phi(\pi)$, with $w\in\mathbb{R}^{36}_{\ge0}$ and features $\phi$ accumulated over the plan tree:
+\begin{itemize}
+\item arithmetic per codelet family ($n1$, $n2$, $t1$, $t2$, $t3$, $q1$, real) and register width (scalar, 128, 256 and 512 bits), with SIMD codelets applied to fewer transforms than the vector length charged for full vectors, plus a surcharge for radices above 16;
+\item cache lines moved per loop level, attributed to L1, L2, L3 or DRAM by the loop's footprint, including L1 set conflicts for power-of-two strides;
+\item child-plan calls made by vector loops;
+\item for threaded regions, the critical path $c_{\text{par}}/L(W,T)$ with $L$ from Eq.~\eqref{eq:lanes}, plus a fixed hand-off charge per region, so that small transforms are not threaded;
+\item for column-buffered loops, the shadow plan on blocks of $b$ columns plus the copy traffic, instead of the strided loop.
 \end{itemize}
 
-\paragraph{ESTIMATE planning.} MATLAB plans with \texttt{FFTW\_ESTIMATE}. Nothing is timed: each solver is tried in registration order, a plan's cost is its operation count (adds $+$ muls $+\,2\cdot$fmas $+$ other), and a fixed set of impatience flags prunes the search. The plan, and with it the exact sequence of floating-point operations, depends only on the problem, the flags and the thread count.
+\paragraph{Calibration.} The weights were fitted once by non-negative least squares~\cite{lawson1974nnls} on 2408 timed plans of 102 training problems drawn at random outside both evaluation suites. Alternative plans for each problem were obtained by perturbing the cost with seeded noise and were timed interleaved. Fit quality is measured by plan \emph{regret}, the geometric mean over problems of $t(\arg\min_\pi c(\pi))/\min_\pi t(\pi)$. The fitted model has in-sample regret 1.127 and five-fold cross-validated regret 1.128; ranking by operation count alone gives 1.242 on the same plans. The weights are compiled in, so planning is deterministic. They are specific to the calibration CPU, and a script in the repository refits them on another machine.
 
-\paragraph{Build.} The library is the scalar build (no SIMD codelets) compiled with \texttt{-O2 -ffp-contract=off}, so no multiply and add are fused into an FMA. Twiddle factors are computed at plan time in double precision, for both precisions, from the C library's $\cos$ and $\sin$; those calls are the only platform-dependent arithmetic.
+\subsection{Evaluation methodology}\label{sec:evalmethod}
 
-\paragraph{Threads.} With $T>1$ threads, extra solvers split the outermost vector loop, or the butterfly columns of a Cooley--Tukey step, into $T$ blocks that run on a pthread pool. The arithmetic within each block is that of the serial code.
+\paragraph{Platform.} All measurements were taken on one KVM guest on an AMD EPYC (Zen~4) host with 4 cores and 8 hardware threads, AVX-512, 32~KiB L1d and 1~MiB L2 per core, 32~MiB L3 and 32~GiB of RAM, running Ubuntu 24.04 (Linux 6.1, glibc 2.39) with clang 18.1.3.
 
-\section{Improvements}
-Every speedup below is a geometric mean over the 128-case frozen suite (Section~\ref{sec:method}), relative to the baseline compiled with the same compiler and flags.
+\paragraph{Baseline.} The baseline is FFTW~3.3.10, scalar build, \texttt{FFTW\_ESTIMATE} planning, FMA contraction off, the configuration MATLAB R2026b ships (checkable with \texttt{version('-fftw')}). We rebuild it on the same machine as a single translation unit with clang \texttt{-O2 -ffp-contract=off} and compile fftchode with the same compiler and flags. All comparisons are against this configuration rebuilt on the same machine; we report no MATLAB timings.
 
-\subsection{Per-ISA scalar codelets (both modes, bit-identical)}
-Each scalar codelet is compiled three times from the same source, for generic x86-64, AVX2 and AVX-512, using per-function target attributes with FMA contraction off. Each copy computes the same scalar IEEE operations in the same order. The AVX-512 copy has 32 floating-point registers instead of 16, which removes most spills in large codelets: double $n1_{64}$ drops from 2761 to 1873 instructions. The planner picks the copy for the running CPU. When a plan's rows fall eight or more times on one L1 set (power-of-two column strides), it keeps the generic copy, because the AVX-512 load schedule loses there. Effect: removing this change lowers baseline mode from $1.147\times$ to $1.065\times$ at one thread and from $2.85\times$ to $2.64\times$ at eight.
+\paragraph{Suites.} The \emph{frozen} suite has 128 problems in single and double precision covering c2c, r2c and c2r; 1-D, 2-D and 3-D; batched and MATLAB-style strided layouts; and small, power-of-two, mixed-radix, prime, large-prime-factor and cache-exceeding sizes. It was fixed before any optimization. The \emph{held-out} suite has 78 further problems. Its SHA-256 hash was committed before tuning began, the file was revealed only for the final measurements, and the planner's training set excludes both suites.
 
-\subsection{Column buffering for L1-aliasing strides (both modes, bit-identical)}
-A vector loop over adjacent columns at a large stride, such as \texttt{fft(x,[],2)} or the column pass of a 2-D or 3-D transform, touches one cache line per element per transform. With power-of-two strides those lines share a few L1 sets. When the stride aliases in L1, the loop instead copies one cache line of adjacent columns (4 complex doubles, 8 complex floats) into a contiguous buffer of at most 256~KiB, transforms them there with a \emph{shadow} child plan, and copies back. In baseline mode the shadow is kept only if its plan structure equals the strided child's, so the arithmetic is unchanged. The shadow is planned on the plan's own array plus the small buffer, so it adds no peak memory. Effect alone: $1.052\times$ at one thread (CI $1.034$--$1.082$), and $1.6$--$3.2\times$ on the aliasing 2-D, 3-D and strided cases.
+\paragraph{Timing.} One harness links each library through the FFTW~3 API, or a thin adapter for libraries without it, with 128-byte-aligned buffers. Each round runs every case once per binary as a separate short process, interleaved case by case in rotating order, so that host contention affects all binaries alike. Binaries are pinned with \texttt{taskset} to one CPU at one thread and to all eight CPUs at eight threads, and the baseline always runs at the same thread count as the library it is compared with. Within a run the transform is repeated in at least three batches of at least 20~ms; the per-round value is the minimum batch time per transform and the per-case statistic $\tilde t_i$ is the median over rounds. The speedup of library $X$ on case $i$ is $s_i=\tilde t_i(\text{baseline})/\tilde t_i(X)$, the suite figure is the geometric mean $\exp\big(\tfrac1N\sum_i\ln s_i\big)$, and 95\% confidence intervals come from a paired bootstrap over rounds with 2000 resamples~\cite{efron1993bootstrap}. Hypervisor steal time is logged per round. In an A/A control (the baseline against a byte copy of itself) the one-thread suite geometric mean stayed within about $\pm1\%$ of 1 over three rounds; individual cases vary more. Planning time is measured separately from execution and reported, never folded into a speedup, and library comparisons use matched planning effort (ESTIMATE against ESTIMATE, MEASURE against MEASURE).
 
-\subsection{Thread pool and work-based lane count (both modes, bit-identical)}
-FFTW's pool wakes a worker through a semaphore on every hand-off, which costs about $50\,\mu$s per call on a virtual machine. The new pool hands work over through an atomic slot. Workers spin for up to $100\,\mu$s before sleeping, the caller spins up to 1~ms on join, and lane $j$ always goes to the same worker. A threaded loop with $W$ operations runs its FFTW-defined blocks on $\min(\text{blocks},W/16384)$ lanes, and nested loops share one lane budget equal to the CPU count. Loops whose outputs interleave within a cache line stay on the caller only when their blocks are themselves threaded or the loop is under $10^6$ operations; this fixes an early version that serialized 1-D c2r of size 65536. Blocks and child plans are unchanged, so results are bit-identical. Effect alone: $1.005\times$ at one thread, $2.71\times$ at eight threads (baseline mode).
+\paragraph{Accuracy.} Each case is also executed by long-double FFTW~3.3.10 on the same input, already rounded to the working precision. We report the relative rms error $\lVert y-y_{\text{ref}}\rVert_2/\lVert y_{\text{ref}}\rVert_2$ and the relative maximum error.
 
-\subsection{SIMD codelets (fast mode)}
-Fast mode registers FFTW~3.3.10's own SIMD codelets for SSE2, AVX, AVX2, AVX2-128 and AVX-512, plus NEON on aarch64. Each is compiled under a target pragma and enabled at run time by CPUID, so the file needs no \texttt{-m} flags. Their operation order differs from the scalar codelets, so results differ at rounding level. fftchode adds three solvers on top:
-\begin{itemize}
-\item \emph{rdft2-pair}: two real transforms as one complex DFT of $z=x+iy$, with $X_f=(Z_f+\overline{Z_{n-f}})/2$ and $Y_f=(Z_f-\overline{Z_{n-f}})/(2i)$. It is used for real columns and odd-length batches.
-\item \emph{rdft2-embed}: an odd-length real transform as the complex DFT of $x+0i$, so Bluestein and Rader run in SIMD.
-\item \emph{dft-colpack}: an SIMD transpose of adjacent complex columns into contiguous scratch. Only the measuring planners use it.
-\end{itemize}
-In fast mode, Bluestein stores only half of the chirp ($w_{n-k}=-w_k$) and half of its transform (which is even). Effect: SIMD alone gives $1.87\times$ at one thread. Removing SIMD from the final build lowers fast mode from $2.67\times$ to $1.24\times$ (one thread) and from $6.35\times$ to $3.12\times$ (eight threads). Removing the three solvers costs 2--3\%.
+\paragraph{Memory and size.} A counting allocator records the heap bytes the library holds above the caller's input and output buffers. We report the peak over planning plus one execution. Code size is the \texttt{text} and \texttt{data} size of the compiled object.
 
-\subsection{Cost-model planner with a search budget (fast mode)}
-With SIMD codelets, ESTIMATE's operation count is a poor predictor: FFTW's measuring planner beats it by $1.7\times$, mostly on power-of-two 2-D, strided and batched problems. Fast mode keeps FFTW's planner but does two things differently.
-\begin{itemize}
-\item \textbf{Search.} It plans every applicable solver. After $10^4$ evaluated plans per problem, the rest of the search prunes as stock ESTIMATE does. The budget is a count, so plans are deterministic and the worst planning time stays near stock ESTIMATE's (1.7~s versus 1.5~s for $n=720720$).
-\item \textbf{Cost.} It ranks plans by $\sum_k w_kf_k$ over 36 features: arithmetic per codelet family and register width, with partial SIMD vectors charged as full ones; cache lines moved per loop level at L1/L2/L3/DRAM distance, including L1 set conflicts; child calls per loop; and a radix-above-16 surcharge.
-\item \textbf{Threads and buffering.} A threaded region costs its critical path over the lanes the pool will actually use, plus a hand-off charge. Column-buffered loops are priced as executed.
-\end{itemize}
-The weights were fitted once by non-negative least squares on timed plans of 102 training problems. None of them shares a shape with the frozen or held-out suite. Five-fold cross-validated plan regret is 1.13, against 1.24 for the operation count alone. Planning costs 4~ms geometric mean (stock ESTIMATE: 0.4~ms). Effect: removing the planner lowers fast mode from $2.67\times$ to $1.93\times$ (one thread) and from $6.35\times$ to $4.92\times$ (eight threads).
+\section{Results}\label{sec:results}
 
-\section{Results}\label{sec:method}
-\paragraph{Method.} All timing ran on one machine: a KVM guest on AMD EPYC (Zen~4), with 4 cores and 8 threads, AVX-512, 32~MiB L3, Ubuntu 24.04 and clang~18.1.3. The frozen suite has 128 problems in single and double precision: c2c, r2c and c2r; 1-D, 2-D and 3-D; batched and MATLAB-style strided; and small, power-of-two, mixed-radix, prime, large-prime-factor and cache-exceeding sizes. It was fixed before any optimization. A held-out suite of 78 different problems was committed by hash and never used for tuning. Each binary is pinned (one core for one thread, all eight CPUs otherwise), and cases are interleaved between binaries one by one. The statistic is the per-case median over rounds of the per-round best of three batches. Speedups are geometric means over cases, with 95\% CIs from a paired bootstrap over rounds. Planning and execution are timed separately. The baseline is FFTW~3.3.10 scalar in one file, built with clang \texttt{-O2 -ffp-contract=off}; built with g++ it is 4\% faster.
+\pending{Results are held until the comparison audit (threading configuration, compiler flags, planning budgets, oneMKL on AMD, per-cell coverage) finishes. Planned content: (i)~speedup over the baseline for baseline and fast modes, frozen and held-out suites, 1 and 8 threads, with 95\% CIs; (ii)~per-case speedup distribution figure; (iii)~ablation table (each change removed from the final build); (iv)~planning-time table (stock ESTIMATE, fast ESTIMATE, MEASURE, PATIENT; geometric mean and maximum); (v)~comparator table: FFTW scalar and AVX-512 at ESTIMATE/MEASURE/PATIENT, oneMKL (generic SSE2 kernels on this AMD CPU), AOCL-FFTW, ducc0, pocketfft, PFFFT on its supported subset, KissFFT, FFTE; (vi)~ratio to the per-cell fastest library by class; (vii)~accuracy against long-double FFTW; (viii)~peak heap and compiled size; (ix)~regressions: \texttt{d\_rb1024} in baseline mode at one thread, fast-mode peak heap from Bluestein on large odd real primes, 10.2~MB of text, and the 8-thread PATIENT comparison that did not finish.}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{llcc}
-\toprule
-mode & suite & 1 thread & 8 threads\\
-\midrule
-baseline & frozen (7 rounds) & 1.143 (1.136--1.159) & 2.88 (2.82--2.96)\\
-baseline & held-out (5 rounds) & 1.155 (1.133--1.167) & 2.81 (2.79--2.95)\\
-fast & frozen & 2.67 (2.65--2.74) & 6.42 (6.22--6.55)\\
-fast & held-out & 2.93 (2.89--2.95) & 6.94 (6.68--7.29)\\
-\bottomrule
-\end{tabular}
-\caption{Speedup over the baseline, geometric mean (95\% CI).}
-\end{table}
+\section{Future work}\label{sec:future}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lcc}
-\toprule
-build (frozen suite, 5 rounds) & 1 thread & 8 threads\\
-\midrule
-baseline mode, all changes & 1.147 & 2.85\\
-\quad without per-ISA scalar codelets & 1.065 & 2.64\\
-\quad column buffering alone (separate run) & 1.052 & 1.02\\
-\quad thread pool alone (separate run) & 1.005 & 2.71\\
-fast mode, all changes & 2.673 & 6.35\\
-\quad without SIMD codelets & 1.237 & 3.12\\
-\quad without the cost-model planner & 1.933 & 4.92\\
-\quad without pair/embed/colpack solvers & 2.620 & 6.18\\
-\quad without per-ISA scalar codelets & 2.637 & 6.24\\
-\bottomrule
-\end{tabular}
-\caption{Ablation: speedup over the baseline when one change is removed.}
-\end{table}
+\paragraph{Single-thread kernels and planning.} At one thread the largest gaps are to libraries with stronger search (AOCL's application-optimization planner and measured planning in FFTW and AOCL) and to hand-written SIMD kernels (PFFFT, and oneMKL in single precision). Two directions follow: a richer cost model (execution-port pressure, prefetch distance, twiddle-table footprint) fitted on a larger training set, and PFFFT-style kernels that keep data in a SIMD-interleaved layout across radix passes instead of loading and storing it in every codelet.
 
-\paragraph{Comparators.} Each library ran on the same machine and suite, at its best planning, with planning timed separately. Table~\ref{tab:cmp} gives suite geometric means over the baseline. In the per-cell comparison against the fastest library in each cell, fftchode fast mode with ESTIMATE reaches a geometric-mean ratio of 0.62 at one thread and 0.82 at eight, and is fastest in 2 and 41 of 128 cells. With \texttt{FFTW\_MEASURE} the ratios are 0.78 and 0.98, and it is fastest in 10 and 57 cells. The per-class breakdown is in \texttt{bench/results/SUMMARY.md}.
+\paragraph{Problem classes.} Primes and large prime factors lose to libraries that choose better convolution lengths for Bluestein and Rader. Strided real transforms lose to ducc0. Large power-of-two c2r transforms are computed by FFTW in one real pass, while fftchode's real paths remain partly scalar. Power-of-two strided c2c problems whose column block exceeds the 256~KiB buffer are handled only by the measuring planners' column packing.
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
-\toprule
-library (planning) & cases & 1 thread & 8 threads\\
-\midrule
-fftchode fast (ESTIMATE) & 128 & 2.65 & 6.69\\
-fftchode fast (MEASURE) & 128 & 3.43 & 7.62\\
-fftchode fast (PATIENT) & 102$^a$ & 3.75 & --\\
-FFTW 3.3.10 AVX-512 (ESTIMATE) & 128 & 1.88 & 1.43\\
-FFTW 3.3.10 AVX-512 (MEASURE) & 128 & 3.27 & 2.40\\
-FFTW 3.3.10 AVX-512 (PATIENT) & 102$^a$ & 3.66 & --\\
-AOCL-FFTW 6.0 (ESTIMATE) & 128 & 2.06 & 1.53\\
-AOCL-FFTW 6.0 (MEASURE) & 128 & 3.47 & 2.87\\
-AOCL-FFTW 6.0 app-opt (MEASURE) & 97 / 63$^b$ & 3.86 & 12.97\\
-oneMKL 2026.2 DFTI & 128 & 2.49 & 5.07\\
-ducc0 0.42 (\texttt{-O3 -march=native}) & 128 & 1.59 & 3.17\\
-pocketfft (\texttt{-O3 -march=native}) & 128 & 1.16 & 1.80\\
-PFFFT (\texttt{-march=native}) & 50$^c$ & 3.13 & 5.96\\
-KissFFT & 98$^c$ & 0.57 & 1.12\\
-FFTE 7.0 & 21$^c$ & 1.08 & 2.40\\
-\bottomrule
-\end{tabular}
-\caption{Suite geometric-mean speedup over the baseline. $^a$Problems of at most $2^{18}$ points; PATIENT planning of larger ones took over 10 minutes each, and the 8-thread PATIENT run did not finish. $^b$Cases whose planning finished within 30~s (1 thread / 8 threads); the rest are larger problems. $^c$Only the cases the library supports. oneMKL runs its generic SSE2 kernels on this AMD CPU, and no setting changed that.\label{tab:cmp}}
-\end{table}
+\paragraph{Memory and size.} Fast mode computes large odd real primes as complex Bluestein transforms, which roughly doubles their peak heap; a real-input Bluestein variant would remove this. The per-ISA codelet copies and SIMD families make the object about $4.6\times$ the baseline's text size; building only the families present on the target, or sharing code between precisions, would reduce it.
 
-\paragraph{Where fftchode loses.} At one thread, the fastest library in a cell is usually AOCL's search-based planner, FFTW or AOCL with MEASURE or PATIENT, PFFFT (on the sizes it supports) or oneMKL (single precision). fftchode's ESTIMATE plans are between ESTIMATE and MEASURE quality: the planner's measured gap to MEASURE is $0.78\times$. The largest gaps are:
-\begin{itemize}
-\item primes and large prime factors, where others use better convolution lengths;
-\item strided real transforms, where ducc0 wins;
-\item large power-of-two c2r, which FFTW computes in a single real pass while fftchode's real paths stay partly scalar;
-\item power-of-two strided c2c whose buffer exceeds 256~KiB, which only the measuring planners' column packing handles.
-\end{itemize}
-Against the baseline itself, fast mode has no cell whose 95\% CI lies below $0.97\times$ on either suite, at 1 or 8 threads; the large power-of-two strided and 2-D/3-D held-out cases that lost $0.71$--$0.90\times$ before the planner priced column buffering now gain. Baseline mode has one such cell, \texttt{d\_rb1024} at one thread ($0.93\times$, CI upper bound $0.96$), whose plan and arithmetic are unchanged; the cause is not established (code layout or the per-ISA copy are candidates). Planning time grows about tenfold in fast mode (4~ms geometric mean) but stays within $1.2\times$ of stock ESTIMATE on the worst highly composite sizes.
+\paragraph{Open regressions.} One baseline-mode case is slower than the baseline (\texttt{d\_rb1024} at one thread) although its plan and arithmetic are unchanged; the cause, code layout or the per-ISA copy chosen, is not established. The 8-thread PATIENT comparison did not finish within its time limit.
 
-\paragraph{Accuracy.} Errors were measured against long-double FFTW on the frozen suite as relative rms error. Fast mode has a geometric mean of $2.43\times10^{-16}$ (double) and $1.34\times10^{-7}$ (single), against $2.53\times10^{-16}$ and $1.39\times10^{-7}$ for the baseline. Its worst case is 1.46 times the baseline's error (\texttt{rf127}, via Bluestein). For comparison, oneMKL has $2.83\times10^{-16}$ and $1.36\times10^{-7}$, FFTW SIMD $2.47\times10^{-16}$ and $1.33\times10^{-7}$, and AOCL $2.41\times10^{-16}$ and $1.31\times10^{-7}$. Baseline mode is bit-identical to scalar FFTW~3.3.10. It passes a 4020-case battery of outputs and exported wisdom, matches the frozen suite's output hashes at 1 and 8 threads, and gives the same per-case results as the earlier single-file build against MATLAB R2026b ground truth.
+\paragraph{Other hardware.} The cost-model weights, cache parameters and hand-off charge were fitted on one Zen~4 virtual machine. General claims need evaluation on bare metal, on Intel processors (where oneMKL selects its optimized kernels), and on Arm with NEON and SVE; SVE would need new codelets, since FFTW~3.3.10 has none. GPU libraries are outside the scope of an FFTW-compatible CPU library but are the natural comparison for large batched transforms.
 
-\paragraph{Memory and size.} Peak heap was measured as the bytes the library allocates above the caller's arrays during planning and one execution. Baseline mode uses the same as the baseline: a geometric mean of 230~KiB against 237~KiB, and 287.5 against 287.7~MiB summed over the suite. Fast mode needs 728~KiB per case (FFTW AVX-512: 683~KiB), mostly the larger solver tables. Its suite total is 388~MiB (FFTW AVX-512: 343~MiB) because \emph{rdft2-embed} computes large odd real primes as complex Bluestein transforms: 106~MB for $n=1000003$ in double, against 58~MB. fftchode does not reduce memory, and memory was not the goal. Compiled with clang, the object has 10.2~MB of text, against 2.2~MB for the baseline and 6.9~MB for the two FFTW AVX-512 libraries together; with g++ it has 8.8~MB.
+\section{Conclusion}\label{sec:conclusion}
 
-\section{Limitations}
-\begin{itemize}
-\item All timings come from one cloud machine, an AMD Zen~4 KVM guest. The planner's weights, cache sizes and hand-off cost were fitted on this CPU class, and other CPUs may need a refit (\texttt{bench/planner/}).
-\item Baseline mode is bit-identical except for the payload of a NaN produced from NaN inputs. The per-ISA codelet copies may propagate a different operand's NaN, which IEEE~754 leaves unspecified.
-\item No speed comparison with MATLAB itself was made. MATLAB timings are only available from different hardware.
-\item The column-strided cases larger than the 256~KiB buffer, and PATIENT at eight threads, remain open.
-\end{itemize}
+\pending{conclusion written from the audited numbers: bit-identical speedup at 1 and 8 threads with exact reproducibility; deterministic planner quality relative to measured planning at ESTIMATE cost; 8-thread standing against the per-cell fastest library and FFTW AVX-512 MEASURE; single-thread ratio to the per-cell best (not state of the art); single-machine limitation.}
+
+\paragraph{Availability.} Source, build files, test batteries, the benchmark harness, both suites and the per-case CSV results are in the fftchode repository (\texttt{src/}, \texttt{bench/suite/}, \texttt{bench/results/}).
+
+\bibliographystyle{plain}
+\bibliography{fftchode}
 
 \end{document}
