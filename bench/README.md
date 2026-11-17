@@ -1,19 +1,32 @@
 # bench: FFT library benchmark harness
 
-Compares this repository's single-file FFTW (`src/fft.cpp`) with upstream FFTW, pocketfft, KissFFT and FFTE under
+There are two harnesses. The committed results in `bench/results/` come from the frozen-suite harness in `bench/suite/`; `bench/run.sh` (below) is the older benchFFT-style sweep.
+
+## Frozen-suite harness (`bench/suite/`)
+
+`frozen.txt` (128 cases, sha256 3f21c096…) and `heldout.txt` (78 cases, sha256 in `heldout.sha256`, never used for tuning) list the problems. `fftsuite.cpp` runs any FFTW 3-API library on them in `time`, `mem`, `hash` or `err` mode.
+
+    bench/suite/build.sh /tmp/fc build/fftchode.o                    # /tmp/fc and /tmp/fc-mem (REF=libfftw3l.a adds /tmp/fc-err)
+    bench/suite/compare.py --suite bench/suite/frozen.txt --threads 1 --rounds 7 --out /tmp/run base=/path/to/baseline fast=/tmp/fc
+    bench/suite/summarize.py bench/results                            # regenerates bench/results/SUMMARY.md
+
+`compare.py` interleaves the binaries case by case and round by round, and reports geometric-mean speedups with paired-bootstrap 95% confidence intervals. Set `FFTCHODE_NUMERICS=fast` in a wrapper script to time fast mode, and use `case_timeout.py` for libraries whose planning can hang. `bench/results/` holds the per-case CSVs (`frozen-`, `heldout-`, `ablation-`, `comparators-{estimate,measure,patient}-t{1,8}.csv`, `memory.csv`, `error.csv`, `size.csv`), `ENV.txt` and `SUMMARY.md`.
+
+## benchFFT sweep (`bench/run.sh`)
+
+Compares this repository's single-file FFTW (`src/fftchode.cpp`) with upstream FFTW, pocketfft, KissFFT and FFTE under
 matched conditions: speed (benchFFT methodology), peak memory, and compiled size. One command builds
 everything and writes CSVs plus a summary to `bench/results/`.
 
     bench/run.sh                                  # everything, defaults
-    bench/run.sh --sizes "64 1024 1000003" --trials 3 --threads "1 4" --libs "fftcpp fftw-simd" --prec d
+    bench/run.sh --sizes "64 1024 1000003" --trials 3 --threads "1 4" --libs "fftchode fftw-simd" --prec d
     bench/run.sh --skip-build --skip-mem --skip-size --out /tmp/quick
     bench/run.sh --help
 
-The results committed in `bench/results/` were produced with `bench/run.sh --trials 7 --time-min 0.1` (all other options default;
-the run options and wall time are appended to `results/ENV.txt`). The defaults (5 trials, 0.05 s batches) take about 16 minutes on a 4-vCPU machine.
+`run.sh` writes to `bench/results/` by default (use `--out` to keep the committed results); the run options and wall time are appended to `ENV.txt`. The defaults (5 trials, 0.05 s batches) take about 16 minutes on a 4-vCPU machine.
 
 Options: `--sizes --trials --threads --libs --prec --kinds --time-min --mem-sizes --timeout --out --force --skip-build --skip-speed --skip-mem --skip-size`.
-Library ids: `fftcpp fftw-scalar fftw-simd pocketfft kissfft ffte`; precisions `d s`; kinds `c` (complex forward) `r` (real forward, r2c).
+Library ids: `fftchode fftw-scalar fftw-simd pocketfft kissfft ffte`; precisions `d s`; kinds `c` (complex forward) `r` (real forward, r2c).
 Requirements: clang/clang++, make, curl, git, python3, and gfortran (build.sh tries `sudo apt-get install gfortran` if it is missing;
 without it FFTE is skipped). Network access is needed on the first run. Run on an otherwise idle machine; `run.sh` prints the
 load average before timing.
@@ -25,7 +38,7 @@ finished measurements are cached under `bench/build/parts` (keyed by parameters 
 
 | id | library | how it is built |
 |---|---|---|
-| fftcpp | this repo's `build/fft.o` (FFTW 3.3.10 amalgamation, scalar, d+s, pthreads) | repo Makefile: `clang++ -std=c++17 -O2 -ffp-contract=off -pthread -c src/fft.cpp`; FFTW API benchee, header `src/fftw3.h` |
+| fftchode | this repo's `build/fftchode.o` (FFTW 3.3.10 amalgamation, scalar, d+s, pthreads) | repo Makefile: `clang++ -std=c++17 -O2 -ffp-contract=off -pthread -c src/fftchode.cpp`; FFTW API benchee, header `src/fftchode.h` |
 | fftw-scalar | upstream FFTW 3.3.10 tarball (sha256 56c93254...467), no SIMD | `configure --enable-threads --with-combined-threads --disable-fortran --disable-shared --enable-static CC=clang CFLAGS="-O2 -ffp-contract=off"` (+ `--enable-single` for float) |
 | fftw-simd | same tarball with SIMD | same plus `--enable-sse2 --enable-avx --enable-avx2` (CPU also has AVX-512; not enabled because the brief listed sse2/avx/avx2). configure adds the ISA flags (-mavx, -mavx2 -mfma) for the SIMD codelets only |
 | pocketfft | mreineck/pocketfft branch `cpp`, commit 4d865cba24359b05b37da4e75aee24498c3b78e7, header-only | `clang++ -std=c++17 -O2 -ffp-contract=off -DPOCKETFFT_CACHE_SIZE=16 -pthread` |
@@ -37,7 +50,7 @@ the same -O2 / -ffp-contract=off flags are passed). `results/ENV.txt` records th
 Every binary is linked statically (`-static`). No `-march` flags are used anywhere, so only FFTW-SIMD (via its own runtime-dispatched codelets)
 uses AVX/SSE2 beyond the x86-64 baseline.
 
-Planning: `FFTW_ESTIMATE` for fft.cpp and both upstream FFTW builds (MATLAB's mode). Buffers are 128-byte aligned (libbench's `memalign`) for every library, so the
+Planning: `FFTW_ESTIMATE` for fftchode and both upstream FFTW builds (MATLAB's mode). Buffers are 128-byte aligned (libbench's `memalign`) for every library, so the
 SIMD codelets are eligible. Transforms are out-of-place (input preserved) except FFTE, which only offers in-place
 (the `placement` column says which). Forward transforms only. Real transforms are r2c with N/2+1 complex output
 (pocketfft `r2c`, KissFFT `kiss_fftr`, FFTW `plan_dft_r2c`); KissFFT needs even N for r2c and FFTE 7.0 has no 1-D real routine.
@@ -65,7 +78,7 @@ mflops = 5 N log2(N) / t (complex) or 2.5 N log2(N) / t (real), t in microsecond
 the median over trials (`mflops_median`, the headline), the best trial (`mflops_best` = benchFFT's min-time convention) and the worst (`mflops_worst`),
 plus all trial times. Input is uniform random data in [-0.5, 0.5). Each cell runs in its own forked process, so a crash or a 600 s timeout only loses that cell.
 Plan time: `plan_cold_s` is the first `setup()` in that fresh process; `plan_warm_s` is the median of three further plan/destroy cycles. Plan and execution are timed separately.
-Threads: `threads=1` and `threads=nproc` (4 here) for FFTW (`fftw_init_threads` + `fftw_plan_with_nthreads`), fft.cpp (same API) and pocketfft (the `nthreads` argument).
+Threads: `threads=1` and `threads=nproc` (4 here) for FFTW (`fftw_init_threads` + `fftw_plan_with_nthreads`), fftchode (same API) and pocketfft (the `nthreads` argument).
 KissFFT and FFTE are single-threaded.
 
 Memory (`--mode mem`): one plan + one execution in a freshly exec'd process per cell (`memory.csv`).
@@ -77,7 +90,7 @@ Memory (`--mode mem`): one plan + one execution in a freshly exec'd process per 
   measurement for a do-nothing benchee (`null`) at the same size. The kernel batches per-task RSS counters, so values below ~256 KiB are not resolved; use the large sizes for conclusions.
 
 Compiled size (`size.csv`): `size -t` totals (text/data/bss) and file size of the library object or archive, and the size of the stripped static benchmark binary
-(driver + libbench + libc + library) together with the same binary using a do-nothing benchee; the difference is the library's own contribution. fft.o holds both precisions and threads in
+(driver + libbench + libc + library) together with the same binary using a do-nothing benchee; the difference is the library's own contribution. fftchode.o holds both precisions and threads in
 one object; the FFTW archives are per precision, so the summary also sums them. pocketfft is header-only: its "artifact" is the object compiled from the benchee that instantiates c2c/r2c.
 Binaries are not linked with `--gc-sections`.
 
@@ -89,10 +102,10 @@ Binaries are not linked with `--gc-sections`.
 ## Caveats
 
 - Absolute mflops are not operation counts and only compare libraries under the same formula. Cloud VM (KVM guest, AMD EPYC, 4 vCPUs that are SMT siblings of 2 cores): timings are noisier than bare metal, and threads=4 uses hyperthreads. No CPU pinning or frequency control.
-- FFTW_ESTIMATE does not account for threading overhead, so threaded FFTW plans for small N are often much slower than threads=1 (upstream FFTW shows the same; fft.cpp matches it).
+- FFTW_ESTIMATE does not account for threading overhead, so threaded FFTW plans for small N are often much slower than threads=1 (upstream FFTW shows the same; fftchode matches it).
 - pocketfft parallelises across independent 1-D transforms; a single 1-D transform ignores `nthreads`, so its threads=4 column equals threads=1. Its stateless API reuses plans through the plan cache enabled here (16 entries); `setup()` runs one transform, so its plan time includes one execution and the warm plan time is not a plan time.
 - In-place transforms (FFTE) are timed repeatedly on their own output, so values grow by about sqrt(N) per call and can overflow to inf/NaN; modern x86 does not slow down for that, but it is not identical data to the out-of-place runs.
 - KissFFT uses an O(N p) generic butterfly for a prime factor p; N with a prime factor above 1024 (here 1000003) is reported n/a rather than run. KissFFT's real transform needs even N.
 - FFTE 7.0 supports N = 2^a 3^b 5^c only, has no 1-D real routine and fails benchFFT verification at N=2 and N=18 (those cells are recorded as `verify-fail`); it is double precision only. FFTE's Fortran compile (gfortran) is a different compiler front end/back end than the C/C++ libraries (clang).
-- fft.cpp is built by the repository's own Makefile target (`build/fft.o`), so `bench/run.sh` benchmarks whatever `src/fft.cpp` currently contains; `ENV.txt` records its sha256.
+- fftchode is built by the repository's own Makefile target (`build/fftchode.o`), so `bench/run.sh` benchmarks whatever `src/fftchode.cpp` currently contains; `ENV.txt` records its sha256.
 - Results are specific to this machine and toolchain; do not compare them with timings from another machine (e.g. the MATLAB timings recorded on a Mac).
