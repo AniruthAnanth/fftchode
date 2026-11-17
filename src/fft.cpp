@@ -1761,6 +1761,10 @@ enum {
 #define NO_DHT_R2HCP(plnr) (PLNR_L(plnr) & NO_DHT_R2HC)
 #define NO_BUFFERINGP(plnr) (PLNR_L(plnr) & NO_BUFFERING)
 
+/* fftchode: buffers that exist only to describe child problems during planning */
+extern "C" R *X(plan_scratch)(const planner *plnr, size_t n);
+extern "C" void X(plan_scratch_free)(R *p);
+
 typedef enum { FORGET_ACCURSED, FORGET_EVERYTHING } amnesia;
 
 typedef enum { 
@@ -2286,6 +2290,52 @@ extern "C" void X(ifree0)(void *p)
      /* common pattern */
      if (p) X(ifree)(p);
 }
+
+/* fftchode: planning-only buffers.  Solvers allocate a buffer in mkplan only
+   to state child problems, then free it before returning.  Without
+   measurement (ESTIMATE) nothing reads or writes it; only pointer identity and
+   alignment can influence the plan.  On 64-bit targets hand out unique,
+   64-byte-aligned addresses from a never-mapped kernel-half range, so the plan
+   (and wisdom) are unchanged and no memory is allocated. */
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)) && !defined(FFTCHODE_NO_PLAN_SCRATCH)
+#define SCRATCH_BASE ((uintptr_t)0xc000000000000000ull + ((uintptr_t)sizeof(R) << 56))
+#define SCRATCH_END (SCRATCH_BASE + ((uintptr_t)1 << 56))
+static uintptr_t scratch_next = SCRATCH_BASE;
+static long scratch_live;
+
+extern "C" R *X(plan_scratch)(const planner *plnr, size_t n)
+{
+     uintptr_t p;
+     if (!ESTIMATEP(plnr) || scratch_next + n + 128 >= SCRATCH_END)
+	  return (R *) MALLOC(n, BUFFERS);
+     p = scratch_next;
+     scratch_next += ((n + 63) & ~(size_t)63) + 64;
+     ++scratch_live;
+     return (R *) p;
+}
+
+extern "C" void X(plan_scratch_free)(R *p)
+{
+     if ((uintptr_t)p >= SCRATCH_BASE && (uintptr_t)p < SCRATCH_END) {
+	  if (--scratch_live == 0)
+	       scratch_next = SCRATCH_BASE;
+     } else
+	  X(ifree0)(p);
+}
+#undef SCRATCH_BASE
+#undef SCRATCH_END
+#else
+extern "C" R *X(plan_scratch)(const planner *plnr, size_t n)
+{
+     UNUSED(plnr);
+     return (R *) MALLOC(n, BUFFERS);
+}
+
+extern "C" void X(plan_scratch_free)(R *p)
+{
+     X(ifree0)(p);
+}
+#endif
 }
 
 /* ==== kernel/assert.c ==== */
@@ -8421,7 +8471,7 @@ static plan *mkplan(const solver *ego, const problem *p_, planner *plnr)
 
      n = p->sz->dims[0].n;
      nb = choose_transform_size(2 * n - 1);
-     buf = (R *) MALLOC(2 * nb * sizeof(R), BUFFERS);
+     buf = X(plan_scratch)(plnr, 2 * nb * sizeof(R));
 
      cldf = X(mkplan_f_d)(plnr, 
 			  X(mkproblem_dft_d)(X(mktensor_1d)(nb, 2, 2),
@@ -8431,7 +8481,7 @@ static plan *mkplan(const solver *ego, const problem *p_, planner *plnr)
 			  NO_SLOW, 0, 0);
      if (!cldf) goto nada;
 
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
 
      pln = MKPLAN_DFT(P, &padt, apply);
 
@@ -8451,7 +8501,7 @@ static plan *mkplan(const solver *ego, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(buf);
+     X(plan_scratch_free)(buf);
      X(plan_destroy_internal)(cldf);
      return (plan *)0;
 }
@@ -8666,7 +8716,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      ioffset = 1 - roffset;
 
      /* initial allocation for the purpose of planning */
-     bufs = (R *) MALLOC(sizeof(R) * nbuf * bufdist * 2, BUFFERS);
+     bufs = X(plan_scratch)(plnr, sizeof(R) * nbuf * bufdist * 2);
 
      /* allow destruction of input if problem is in place */
      cld = X(mkplan_f_d)(plnr,
@@ -8695,7 +8745,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
           goto nada;
 
      /* deallocate buffers, let apply() allocate them for real */
-     X(ifree)(bufs);
+     X(plan_scratch_free)(bufs);
      bufs = 0;
 
      /* plan the leftover transforms (cldrest): */
@@ -8734,7 +8784,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(bufs);
+     X(plan_scratch_free)(bufs);
      X(plan_destroy_internal)(cldrest);
      X(plan_destroy_internal)(cldcpy);
      X(plan_destroy_internal)(cld);
@@ -10053,7 +10103,7 @@ static plan *mkcldw(const ct_solver *ego_,
      if (!applicable(ego, r, irs, ors, m, v, mcount, plnr))
           return (plan *)0;
 
-     buf = (R *) MALLOC(sizeof(R) * 2 * BATCHDIST(r) * ego->batchsz, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * 2 * BATCHDIST(r) * ego->batchsz);
      cld = X(mkplan_d)(plnr,
 			X(mkproblem_dft_d)(
 			     X(mktensor_1d)(r, 2, 2),
@@ -10063,7 +10113,7 @@ static plan *mkcldw(const ct_solver *ego_,
 			     buf, buf + 1, buf, buf + 1
 			     )
 			);
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      if (!cld) goto nada;
 
      pln = MKPLAN_DFTW(P, &padt, apply);
@@ -11677,7 +11727,7 @@ static int mkP(P *pln, INT n, INT is, INT os, R *ro, R *io,
      R *buf = (R *) 0;
 
      /* initial allocation for the purpose of planning */
-     buf = (R *) MALLOC(sizeof(R) * (n - 1) * 2, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * (n - 1) * 2);
 
      cld1 = X(mkplan_f_d)(plnr, 
 			  X(mkproblem_dft_d)(X(mktensor_1d)(n - 1, 2, os),
@@ -11703,7 +11753,7 @@ static int mkP(P *pln, INT n, INT is, INT os, R *ro, R *io,
      if (!cld_omega) goto nada;
 
      /* deallocate buffers; let awake() or apply() allocate them for real */
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      buf = 0;
 
      pln->cld1 = cld1;
@@ -11722,7 +11772,7 @@ static int mkP(P *pln, INT n, INT is, INT os, R *ro, R *io,
      return 1;
 
  nada:
-     X(ifree0)(buf);
+     X(plan_scratch_free)(buf);
      X(plan_destroy_internal)(cld_omega);
      X(plan_destroy_internal)(cld2);
      X(plan_destroy_internal)(cld1);
@@ -57277,7 +57327,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      A(nbuf > 0);
 
      /* initial allocation for the purpose of planning */
-     bufs = (R *) MALLOC(sizeof(R) * nbuf * bufdist, BUFFERS);
+     bufs = X(plan_scratch)(plnr, sizeof(R) * nbuf * bufdist);
 
      if (hc2rp) {
 	  /* allow destruction of buffer */
@@ -57316,7 +57366,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      }
 
      /* deallocate buffers, let apply() allocate them for real */
-     X(ifree)(bufs);
+     X(plan_scratch_free)(bufs);
      bufs = 0;
 
      /* plan the leftover transforms (cldrest): */
@@ -57352,7 +57402,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(bufs);
+     X(plan_scratch_free)(bufs);
      X(plan_destroy_internal)(cldrest);
      X(plan_destroy_internal)(cldcpy);
      X(plan_destroy_internal)(cld);
@@ -57631,7 +57681,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      ioffset = 1 - roffset;
 
      /* initial allocation for the purpose of planning */
-     bufs = (R *) MALLOC(sizeof(R) * nbuf * bufdist, BUFFERS);
+     bufs = X(plan_scratch)(plnr, sizeof(R) * nbuf * bufdist);
 
      id = ivs * (nbuf * (vl / nbuf));
      od = ovs * (nbuf * (vl / nbuf));
@@ -57659,7 +57709,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 		    TAINT(p->cr, ovs * nbuf), TAINT(p->ci, ovs * nbuf) ));
 	  if (!cldcpy) goto nada;
 
-	  X(ifree)(bufs); bufs = 0;
+	  X(plan_scratch_free)(bufs); bufs = 0;
 
 	  cldrest = X(mkplan_d)(plnr, 
 				X(mkproblem_rdft2_d)(
@@ -57693,7 +57743,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 		    bufs + roffset, bufs + ioffset));
 	  if (!cldcpy) goto nada;
 
-	  X(ifree)(bufs); bufs = 0;
+	  X(plan_scratch_free)(bufs); bufs = 0;
 
 	  cldrest = X(mkplan_d)(plnr, 
 				X(mkproblem_rdft2_d)(
@@ -57729,7 +57779,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(bufs);
+     X(plan_scratch_free)(bufs);
      X(plan_destroy_internal)(cldrest);
      X(plan_destroy_internal)(cldcpy);
      X(plan_destroy_internal)(cld);
@@ -59275,7 +59325,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	  npad = n - 1;
 
      /* initial allocation for the purpose of planning */
-     buf = (R *) MALLOC(sizeof(R) * npad, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * npad);
 
      cld1 = X(mkplan_f_d)(plnr, 
 			  X(mkproblem_rdft_1_d)(X(mktensor_1d)(npad, 1, 1),
@@ -59309,7 +59359,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      if (!cld_omega) goto nada;
 
      /* deallocate buffers; let awake() or apply() allocate them for real */
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      buf = 0;
 
      pln = MKPLAN_RDFT(P, &padt, apply);
@@ -59334,7 +59384,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(buf);
+     X(plan_scratch_free)(buf);
      X(plan_destroy_internal)(cld_omega);
      X(plan_destroy_internal)(cld2);
      X(plan_destroy_internal)(cld1);
@@ -63805,7 +63855,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      A(nbuf > 0);
 
      /* initial allocation for the purpose of planning */
-     bufs = (R *) MALLOC(sizeof(R) * nbuf * bufdist, BUFFERS);
+     bufs = X(plan_scratch)(plnr, sizeof(R) * nbuf * bufdist);
 
      id = ivs * (nbuf * (vl / nbuf));
      od = ovs * (nbuf * (vl / nbuf));
@@ -63819,7 +63869,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 		    TAINT(p->r0, ivs * nbuf), bufs, &p->kind),
 	       0, 0, (p->r0 == p->cr) ? NO_DESTROY_INPUT : 0);
 	  if (!cld) goto nada;
-	  X(ifree)(bufs); bufs = 0;
+	  X(plan_scratch_free)(bufs); bufs = 0;
 
 	  cldrest = X(mkplan_d)(plnr, 
 				X(mkproblem_rdft2_d)(
@@ -63841,7 +63891,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 		    bufs, TAINT(p->r0, ovs * nbuf), &p->kind),
 	       0, 0, NO_DESTROY_INPUT); /* always ok to destroy bufs */
 	  if (!cld) goto nada;
-	  X(ifree)(bufs); bufs = 0;
+	  X(plan_scratch_free)(bufs); bufs = 0;
 
 	  cldrest = X(mkplan_d)(plnr, 
 				X(mkproblem_rdft2_d)(
@@ -63871,7 +63921,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(bufs);
+     X(plan_scratch_free)(bufs);
      X(plan_destroy_internal)(cldrest);
      X(plan_destroy_internal)(cld);
      return (plan *) 0;
@@ -64736,7 +64786,7 @@ static int mkcldrn_gcd(const problem_rdft *p, planner *plnr, P *ego)
 {
      INT n = ego->nd, m = ego->md, d = ego->d;
      INT vl = ego->vl;
-     R *buf = (R *)MALLOC(sizeof(R) * ego->nbuf, BUFFERS);
+     R *buf = X(plan_scratch)(plnr, sizeof(R) * ego->nbuf);
      INT num_el = n*m*d*vl;
 
      if (n > 1) {
@@ -64776,11 +64826,11 @@ static int mkcldrn_gcd(const problem_rdft *p, planner *plnr, P *ego)
 	  ego->super.super.ops.other += num_el * d * 2;
      }
 
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      return 1;
 
  nada:
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      return 0;
 }
 
@@ -64914,7 +64964,7 @@ static int mkcldrn_cut(const problem_rdft *p, planner *plnr, P *ego)
      ego->mc = mc;
      ego->nbuf = (m-mc)*(nc*vl) + (n-nc)*(m*vl);
 
-     buf = (R *)MALLOC(sizeof(R) * ego->nbuf, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * ego->nbuf);
 
      if (m > mc) {
 	  ego->cld1 = X(mkplan_d)(plnr,
@@ -64954,11 +65004,11 @@ static int mkcldrn_cut(const problem_rdft *p, planner *plnr, P *ego)
      ego->super.super.ops.other += 2 * vl * (nc*mc * ((m > mc) + (n > nc))
 					     + (n-nc)*m + (m-mc)*nc);
 
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      return 1;
 
  nada:
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      return 0;
 }
 
@@ -187005,7 +187055,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      n = p->sz->dims[0].n - 1;
      A(n > 0);
-     buf = (R *) MALLOC(sizeof(R) * (2*n), BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * (2*n));
 
      cld = X(mkplan_d)(plnr,X(mkproblem_rdft_1_d)(X(mktensor_1d)(2*n,1,1), 
 						  X(mktensor_0d)(), 
@@ -187023,7 +187073,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      if (!cldcpy)
 	  goto nada;
 
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
 
      pln = MKPLAN_RDFT(P, &padt, apply);
 
@@ -187046,7 +187096,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(buf);
+     X(plan_scratch_free)(buf);
      if (cld)
 	  X(plan_destroy_internal)(cld);  
      return (plan *)0;
@@ -187358,7 +187408,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      n = (n0 = p->sz->dims[0].n) + (p->kind[0] == REDFT00 ? (INT)-1 : (INT)1);
      A(n > 0 && n % 2 == 0);
-     buf = (R *) MALLOC(sizeof(R) * (n/2), BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * (n/2));
 
      inplace_odd = p->kind[0]==RODFT00 && p->I == p->O;
      clde = X(mkplan_d)(plnr, X(mkproblem_rdft_1_d)(
@@ -187374,7 +187424,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 				   p->vecsz->rnk ? p->vecsz->dims[0].os : 0),
 			     p->kind[0]));
      if (!clde) {
-	  X(ifree)(buf);
+	  X(plan_scratch_free)(buf);
           return (plan *)0;
      }
 
@@ -187382,7 +187432,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 			     X(mktensor_1d)(n/2, 1, 1), 
 			     X(mktensor_0d)(), 
 			     buf, buf, R2HC));
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      if (!cldo)
           return (plan *)0;
 
@@ -187790,12 +187840,12 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      p = (const problem_rdft *) p_;
 
      n = p->sz->dims[0].n;
-     buf = (R *) MALLOC(sizeof(R) * n, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * n);
 
      cld = X(mkplan_d)(plnr, X(mkproblem_rdft_1_d)(X(mktensor_1d)(n, 1, 1),
                                                    X(mktensor_0d)(),
                                                    buf, buf, R2HC));
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      if (!cld)
           return (plan *)0;
 
@@ -188113,12 +188163,12 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      p = (const problem_rdft *) p_;
 
      n = p->sz->dims[0].n;
-     buf = (R *) MALLOC(sizeof(R) * n, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * n);
 
      cld = X(mkplan_d)(plnr, X(mkproblem_rdft_1_d)(X(mktensor_1d)(n, 1, 1),
                                                    X(mktensor_0d)(),
                                                    buf, buf, R2HC));
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      if (!cld)
           return (plan *)0;
 
@@ -188630,12 +188680,12 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      p = (const problem_rdft *) p_;
 
      n = p->sz->dims[0].n;
-     buf = (R *) MALLOC(sizeof(R) * n, BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * n);
 
      cld = X(mkplan_d)(plnr, X(mkproblem_rdft_1_d)(X(mktensor_1d)(n/2, 1, 1),
                                                    X(mktensor_1d)(2, n/2, n/2),
                                                    buf, buf, R2HC));
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
      if (!cld)
           return (plan *)0;
 
@@ -188823,7 +188873,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      n = p->sz->dims[0].n + 1;
      A(n > 0);
-     buf = (R *) MALLOC(sizeof(R) * (2*n), BUFFERS);
+     buf = X(plan_scratch)(plnr, sizeof(R) * (2*n));
 
      cld = X(mkplan_d)(plnr,X(mkproblem_rdft_1_d)(X(mktensor_1d)(2*n,1,1), 
 						  X(mktensor_0d)(), 
@@ -188841,7 +188891,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      if (!cldcpy)
 	  goto nada;
 
-     X(ifree)(buf);
+     X(plan_scratch_free)(buf);
 
      pln = MKPLAN_RDFT(P, &padt, apply);
 
@@ -188864,7 +188914,7 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      return &(pln->super.super);
 
  nada:
-     X(ifree0)(buf);
+     X(plan_scratch_free)(buf);
      if (cld)
 	  X(plan_destroy_internal)(cld);  
      return (plan *)0;
