@@ -1,8 +1,12 @@
 // Deterministic battery of FFTW_ESTIMATE transforms. Prints one line per case:
 //   <case> <fnv64 of output bytes> <fnv64 of exported wisdom>
-// Linked once against src/fft.cpp and once against upstream libfftw3/libfftw3f;
+// Linked once against src/fftchode.cpp and once against upstream libfftw3/libfftw3f;
 // the two transcripts must be identical.
-#include "fftw3.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
+#include <fftw3.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

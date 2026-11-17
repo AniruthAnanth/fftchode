@@ -1,10 +1,14 @@
 /*
  * FFTW3 benchee, adapted from benchFFT's benchees/fftw3/doit.c: FFTW_ESTIMATE planning by
  * default (MATLAB's mode), optional "threads=N", complex c2c and real r2c, 1-D only.
- * The same file is compiled against fft.cpp (src/fftw3.h) and against upstream FFTW.
+ * The same file is compiled against fftchode (src/fftchode.h) and against upstream FFTW.
  */
 #include "bench-user.h"
+#if __has_include("fftchode.h")
+#include "fftchode.h"
+#else
 #include <fftw3.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 

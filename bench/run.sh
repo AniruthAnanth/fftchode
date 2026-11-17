@@ -5,7 +5,7 @@
 #                [--kinds "c r"] [--time-min SEC] [--mem-sizes "..."] [--timeout SEC] [--out DIR]
 #                [--force] [--skip-build] [--skip-speed] [--skip-mem] [--skip-size]
 #
-# libs: fftcpp fftw-scalar fftw-simd pocketfft kissfft ffte   prec: d (double) s (single)
+# libs: fftchode fftw-scalar fftw-simd pocketfft kissfft ffte   prec: d (double) s (single)
 # kinds: c (complex forward, c2c)  r (real forward, r2c)
 # Results (CSV) go to <out>/ (default bench/results). Finished measurements are cached under
 # bench/build/parts and reused unless parameters change or --force is given.
@@ -21,7 +21,7 @@ SIZES=$(echo $SIZES)
 MEM_SIZES="1024 65536 1048576 1000003"
 TRIALS=5; TIME_MIN=0.05; TIMEOUT=600
 THREADS="1 $NPROC"
-LIBS="fftcpp fftw-scalar fftw-simd pocketfft kissfft ffte"
+LIBS="fftchode fftw-scalar fftw-simd pocketfft kissfft ffte"
 PREC="d s"; KINDS="c r"; OUT=$HERE/results
 FORCE=0; DO_BUILD=1; DO_SPEED=1; DO_MEM=1; DO_SIZE=1
 
@@ -52,12 +52,12 @@ if [ $DO_BUILD = 1 ]; then "$HERE/build.sh" all; fi
 mkdir -p "$OUT" "$B/parts"
 "$HERE/scripts/env.sh" "$B" > "$OUT/ENV.txt"
 echo "run options: sizes=[$SIZES] trials=$TRIALS time-min=$TIME_MIN threads=[$THREADS] libs=[$LIBS] prec=[$PREC] kinds=[$KINDS] mem-sizes=[$MEM_SIZES]" >> "$OUT/ENV.txt"
-echo "planning:     FFTW_ESTIMATE (fft.cpp and both upstream FFTW builds); placement out-of-place except FFTE (in-place only)" >> "$OUT/ENV.txt"
+echo "planning:     FFTW_ESTIMATE (fftchode and both upstream FFTW builds); placement out-of-place except FFTE (in-place only)" >> "$OUT/ENV.txt"
 
 load=$(cut -d' ' -f1 /proc/loadavg)
 echo "[run] 1-min load average before timing: $load (should be ~0 on an idle machine)"
 
-supports_threads() { case $1 in fftcpp|fftw-scalar|fftw-simd|pocketfft) return 0;; *) return 1;; esac; }
+supports_threads() { case $1 in fftchode|fftw-scalar|fftw-simd|pocketfft) return 0;; *) return 1;; esac; }
 threads_for() { if supports_threads "$1"; then echo $THREADS; else echo 1; fi; }
 
 # measure <mode> <csv> <lib list> <prec> <sizes> [extra args]   -- cached per (lib,prec,threads)

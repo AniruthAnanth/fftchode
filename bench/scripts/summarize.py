@@ -4,7 +4,7 @@ import csv, math, os, sys
 from collections import defaultdict
 
 out = sys.argv[1]
-LIBNAMES = {"fftcpp": "fft.cpp", "fftw-scalar": "FFTW scalar", "fftw-simd": "FFTW SIMD",
+LIBNAMES = {"fftchode": "fftchode", "fftw-scalar": "FFTW scalar", "fftw-simd": "FFTW SIMD",
             "pocketfft": "pocketfft", "kissfft": "KissFFT", "ffte": "FFTE"}
 ORDER = list(LIBNAMES)
 SHOW = [2, 64, 1024, 65536, 1048576, 6, 1000, 27000, 165375, 1000003]
@@ -132,7 +132,7 @@ if mem:
 
 if size:
     L.append("## Compiled size (bytes)\n")
-    L.append("Library artifact = the object/archive that carries the library code (fft.cpp: build/fft.o holds both precisions and threads; "
+    L.append("Library artifact = the object/archive that carries the library code (fftchode: build/fftchode.o holds both precisions and threads; "
              "FFTW: libfftw3.a / libfftw3f.a with threads combined; pocketfft: header-only, so the object compiled from the benchee that instantiates "
              "c2c/r2c; KissFFT: kiss_fft.o + kiss_fftr.o; FFTE: 1-D complex routines only). "
              "text/data/bss from size(1) totals. Binary = stripped static benchmark binary; 'minus null' subtracts the same driver "
@@ -151,7 +151,7 @@ if size:
         rows = [r for r in size if r["lib"] == lib]
         if not rows:
             continue
-        if lib == "fftcpp":
+        if lib == "fftchode":
             rows = rows[:1]
         elif lib == "ffte":
             L.append("| %s (double only) | %s | %s |" % (LIBNAMES[lib], rows[0]["artifact_file_bytes"], rows[0]["text"]))

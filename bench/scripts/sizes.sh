@@ -17,7 +17,7 @@ row() { # lib prec artifact-path
   echo "$lib,$([ $prec = d ] && echo double || echo single),$(basename "$art"),$fb,$t,$d,$b,$(stat -c %s "$bin"),$nb,$(( $(stat -c %s "$bin") - nb ))" >> "$OUT"
 }
 for p in d s; do
-  row fftcpp $p "$REPO/build/fft.o"
+  row fftchode $p "$REPO/build/fftchode.o"
   row fftw-scalar $p "$B/fftw-scalar-$p/inst/lib/libfftw3$([ $p = s ] && echo f).a"
   row fftw-simd $p "$B/fftw-simd-$p/inst/lib/libfftw3$([ $p = s ] && echo f).a"
   row pocketfft $p "$B/obj/bn-pocketfft-$p.o"

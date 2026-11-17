@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MATLAB R2026b fft ground truth against fft.cpp through tests/mlfft.
+"""Compare MATLAB R2026b fft ground truth against fftchode.cpp through tests/mlfft.
 
 usage: matlab_compare.py <ground-truth dir> <mlfft binary> [--md rank|seq] [--scale mul|div] [--csv out.csv]
 

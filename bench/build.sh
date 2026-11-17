@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetches, builds and links everything the benchmark needs. Idempotent: every step
 # is guarded by a stamp (or by make) and can be re-run safely.
-#   build.sh [deps|bins|all]     deps = fetch + FFTW builds + fft.o, bins = libbench/benchees/binaries
+#   build.sh [deps|bins|all]     deps = fetch + FFTW builds + fftchode.o, bins = libbench/benchees/binaries
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
@@ -67,12 +67,12 @@ build_fftw() {
     && make -j"$JOBS" >make.log 2>&1 && make install >install.log 2>&1 )
 }
 
-build_fftcpp() { ( cd "$REPO" && make CXX="$CXX" build/fft.o ) ; }
+build_fftchode() { ( cd "$REPO" && make CXX="$CXX" build/fftchode.o ) ; }
 
 if [ "$WHAT" = deps ] || [ "$WHAT" = all ]; then
   step fetch fetch_all
-  # fft.cpp is rebuilt by make whenever src/fft.cpp changes
-  say "fft.cpp -> build/fft.o"; build_fftcpp > "$LOG/fftcpp.log" 2>&1 || { tail -20 "$LOG/fftcpp.log" >&2; exit 1; }
+  # fftchode is rebuilt by make whenever src/fftchode.cpp changes
+  say "fftchode -> build/fftchode.o"; build_fftchode > "$LOG/fftchode.log" 2>&1 || { tail -20 "$LOG/fftchode.log" >&2; exit 1; }
   for fl in scalar simd; do for pr in d s; do step "fftw-$fl-$pr" build_fftw $fl $pr; done; done
 fi
 [ "$WHAT" = deps ] && exit 0

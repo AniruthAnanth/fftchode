@@ -1,5 +1,12 @@
-# Fidelity configuration: scalar code, no FMA contraction (matches MATLAB R2026b's FFTW build flags)
-CXX      ?= clang++
+# fftchode: FFTW 3.3.10-compatible FFT library in one C++ file.
+# Fidelity flags: scalar code, no FMA contraction (MATLAB R2026b's FFTW build flags)
+# make predefines CXX (g++) and CC (cc), so ?= never applies: default to clang unless set
+ifeq ($(origin CXX),default)
+CXX      = clang++
+endif
+ifeq ($(origin CC),default)
+CC       = clang
+endif
 CXXFLAGS ?= -O2 -ffp-contract=off
 FFT_DEFS ?=
 PY       ?= python3
@@ -7,22 +14,23 @@ BUILD    ?= build
 FFTW_VERSION = 3.3.10
 FFTW_SHA256  = 56c932549852cddcfafdab3820b0200c7742675be92179e59e6215b340e26467
 
-.PHONY: all test test-upstream test-matlab clean
+.PHONY: all lib test test-upstream test-fast test-matlab clean
 
-all: $(BUILD)/fft.o
+all: $(BUILD)/fftchode.o
+lib: $(BUILD)/libfftchode.a
 
-$(BUILD)/fft.o: src/fft.cpp src/fftw3.h
+$(BUILD)/fftchode.o: src/fftchode.cpp src/fftchode.h
 	mkdir -p $(BUILD)
-	$(CXX) -std=c++17 $(CXXFLAGS) $(FFT_DEFS) -pthread -c src/fft.cpp -o $@
+	$(CXX) -std=c++17 $(CXXFLAGS) $(FFT_DEFS) -pthread -c src/fftchode.cpp -o $@
 
-$(BUILD)/libfft.a: $(BUILD)/fft.o
+$(BUILD)/libfftchode.a: $(BUILD)/fftchode.o
 	ar rcs $@ $<
 
-$(BUILD)/fft_dump: tests/fft_dump.cpp $(BUILD)/fft.o
-	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/fft_dump.cpp $(BUILD)/fft.o -pthread -lm -o $@
+$(BUILD)/fftchode_dump: tests/fft_dump.cpp $(BUILD)/fftchode.o
+	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/fft_dump.cpp $(BUILD)/fftchode.o -pthread -lm -o $@
 
-$(BUILD)/mlfft: tests/mlfft.cpp $(BUILD)/fft.o
-	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/mlfft.cpp $(BUILD)/fft.o -pthread -lm -o $@
+$(BUILD)/fftchode_mlfft: tests/mlfft.cpp $(BUILD)/fftchode.o
+	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/mlfft.cpp $(BUILD)/fftchode.o -pthread -lm -o $@
 
 # Upstream FFTW 3.3.10 built from the fftw.org tarball with the same compiler and flags
 $(BUILD)/upstream/stamp:
@@ -40,22 +48,29 @@ $(BUILD)/upstream/stamp:
 	done
 	touch $@
 
-$(BUILD)/fft_dump_upstream: tests/fft_dump.cpp $(BUILD)/upstream/stamp
+$(BUILD)/upstream_dump: tests/fft_dump.cpp $(BUILD)/upstream/stamp
 	$(CXX) -std=c++17 $(CXXFLAGS) -I$(BUILD)/upstream/inst-double/include tests/fft_dump.cpp \
 	  $(BUILD)/upstream/inst-double/lib/libfftw3.a $(BUILD)/upstream/inst-single/lib/libfftw3f.a -pthread -lm -o $@
 
-# Bit-for-bit identity with upstream: every output hash and every plan's wisdom must agree
-test-upstream: $(BUILD)/fft_dump $(BUILD)/fft_dump_upstream
-	$(BUILD)/fft_dump > $(BUILD)/dump_fft.txt
-	$(BUILD)/fft_dump_upstream > $(BUILD)/dump_upstream.txt
-	cmp $(BUILD)/dump_fft.txt $(BUILD)/dump_upstream.txt && echo "upstream identity: $$(wc -l < $(BUILD)/dump_fft.txt) cases bit-identical"
+# Baseline mode is bit-for-bit FFTW 3.3.10: every output hash and every plan's wisdom must agree
+test-upstream: $(BUILD)/fftchode_dump $(BUILD)/upstream_dump
+	$(BUILD)/fftchode_dump > $(BUILD)/dump_fftchode.txt
+	$(BUILD)/upstream_dump > $(BUILD)/dump_upstream.txt
+	cmp $(BUILD)/dump_fftchode.txt $(BUILD)/dump_upstream.txt && echo "upstream identity: $$(wc -l < $(BUILD)/dump_fftchode.txt) cases bit-identical"
+
+# Fast numerics mode: every transform must agree with baseline mode to within roundoff
+$(BUILD)/fftchode_fast_check: tests/fast_check.cpp $(BUILD)/fftchode.o
+	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/fast_check.cpp $(BUILD)/fftchode.o -pthread -lm -o $@
+
+test-fast: $(BUILD)/fftchode_fast_check
+	$(BUILD)/fftchode_fast_check
 
 # Comparison with MATLAB ground truth (directory given by GT=..., never stored in this repo)
-test-matlab: $(BUILD)/mlfft
+test-matlab: $(BUILD)/fftchode_mlfft
 	@test -n "$(GT)" || (echo "usage: make test-matlab GT=<ground-truth dir>"; exit 2)
-	$(PY) tests/matlab_compare.py $(GT) $(BUILD)/mlfft --csv $(BUILD)/matlab_compare.csv
+	$(PY) tests/matlab_compare.py $(GT) $(BUILD)/fftchode_mlfft --csv $(BUILD)/matlab_compare.csv
 
-test: test-upstream
+test: test-upstream test-fast
 
 clean:
 	rm -rf $(BUILD)
