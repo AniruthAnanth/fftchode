@@ -46,7 +46,13 @@ template <> struct Api<double> {
     static void exec(plan p) { fftw_execute(p); }
     static void destroy(plan p) { fftw_destroy_plan(p); }
     static uint64_t wisdom() { char *w = fftw_export_wisdom_to_string(); uint64_t h = fnv(w, strlen(w)); free(w); fftw_forget_wisdom(); return h; }
-    static void threads(int n) { fftw_plan_with_nthreads(n); }
+    static void threads(int n) {
+#ifndef FFT_DUMP_NO_THREADS
+        fftw_plan_with_nthreads(n);
+#else
+        (void)n;
+#endif
+    }
     static const char *tag() { return "d"; }
 };
 template <> struct Api<float> {
@@ -71,7 +77,13 @@ template <> struct Api<float> {
     static void exec(plan p) { fftwf_execute(p); }
     static void destroy(plan p) { fftwf_destroy_plan(p); }
     static uint64_t wisdom() { char *w = fftwf_export_wisdom_to_string(); uint64_t h = fnv(w, strlen(w)); free(w); fftwf_forget_wisdom(); return h; }
-    static void threads(int n) { fftwf_plan_with_nthreads(n); }
+    static void threads(int n) {
+#ifndef FFT_DUMP_NO_THREADS
+        fftwf_plan_with_nthreads(n);
+#else
+        (void)n;
+#endif
+    }
     static const char *tag() { return "s"; }
 };
 
@@ -134,6 +146,10 @@ template <typename T> static void r2r(int n, fftw_r2r_kind kind) {
     typedef Api<T> A;
     T *in = (T *)A::alloc(sizeof(T) * n), *out = (T *)A::alloc(sizeof(T) * n);
     typename A::plan p = A::many_r2r(1, &n, 1, in, out, (const decltype(FFTW_R2HC) *)&kind);
+    if (!p) {  // solver family compiled out (FFT_NO_REODFT)
+        printf("%s r2r k%d %d nt1 noplan\n", A::tag(), (int)kind, n);
+        A::release(in); A::release(out); return;
+    }
     fill(in, n, n * 13 + kind);
     A::exec(p);
     report<T>("r2r k" + std::to_string((int)kind) + " " + std::to_string(n), 1, out, sizeof(T) * n, A::wisdom());
@@ -204,6 +220,7 @@ template <typename T> static void battery(bool quick) {
     for (int k = FFTW_R2HC; k <= FFTW_RODFT11; k++)
         for (int n : {1, 2, 3, 4, 5, 8, 15, 16, 17, 31, 64, 100, 127, 1000, 1024, 4096})
             if (!((k == FFTW_REDFT00) && n == 1)) r2r<T>(n, (fftw_r2r_kind)k);
+#ifndef FFT_DUMP_NO_THREADS
     // threads
     for (int nt : {2, 3, 4, 8, 10}) {
         for (int n : {4096, 65536, 1 << 19, 1 << 20, 1000003, 3 << 20})
@@ -212,13 +229,20 @@ template <typename T> static void battery(bool quick) {
         c2c<T>({512, 512}, 1, false, false, FFTW_FORWARD, nt);
         r2c<T>({256, 256}, 4, false, nt);
     }
+#endif
 }
 
 int main(int argc, char **argv) {
     bool quick = argc > 1 && !strcmp(argv[1], "quick");
+#ifndef FFT_DUMP_NO_THREADS
     fftw_init_threads();
+#ifndef FFT_DUMP_DOUBLE_ONLY
     fftwf_init_threads();
+#endif
+#endif
     battery<double>(quick);
+#ifndef FFT_DUMP_DOUBLE_ONLY
     battery<float>(quick);
+#endif
     return 0;
 }

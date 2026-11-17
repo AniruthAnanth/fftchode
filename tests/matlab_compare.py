@@ -68,6 +68,11 @@ def ops_for(call, shape, md, inverse=None, fwd_shape=None, real_input=False):
         kind = ("S" if sym else "I") if inv else "F"
     if len(dims) == 1:
         return [(kind, dims, lens)]
+    if md == "matlab":
+        # observed: one 1-D pass per dim in ascending order; fft2 of an N-D (N>2) array and the
+        # 'symmetric' 2-D inverse go in descending order (c2r on the last transformed dim)
+        rev = (fn == "fft2" and len(shape) > 2) or kind == "S"
+        md = "seqrev" if rev else "seq"
     if md.endswith("rev"):
         dims, lens, md = dims[::-1], lens[::-1], md[:-3]
     if md == "half":
@@ -93,7 +98,7 @@ def opstr(ops):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("gt"); ap.add_argument("mlfft")
-    ap.add_argument("--md", default="rank"); ap.add_argument("--scale", default="mul")
+    ap.add_argument("--md", default="matlab"); ap.add_argument("--scale", default="div")
     ap.add_argument("--csv")
     a = ap.parse_args()
     man1, idx1 = load(a.gt, "nt1")
@@ -132,6 +137,8 @@ def main():
                     continue  # identical to nt1
                 exp = array(a.gt, sub, row)
                 inp = os.path.join(tmp, "in.bin"); outp = os.path.join(tmp, "out.bin")
+                if nt == 10 and role != "fwd" and idx10[(cid, "fwd")]["pack"]:
+                    data = array(a.gt, "nt10", idx10[(cid, "fwd")])  # inverse of the 10-thread forward
                 open(inp, "wb").write(data)
                 line = "%s %d %d %s %s %s %d %s %d %s\n" % ("d" if cls == "double" else "s", int(cx), len(sh),
                         " ".join(map(str, sh)), inp, outp, nt, a.scale, len(ops), opstr(ops))

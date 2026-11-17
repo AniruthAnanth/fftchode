@@ -55,7 +55,8 @@ template <typename T> struct Arr {
 static std::string scale_mode = "mul";
 static bool inplace_later = false;   // c2c passes after the first one run in place (option "+ip")
 static int pass_no = 0;
-static bool fullbuf = false;         // r2c writes / c2r reads the half spectrum inside a full-size array ("+full")
+static bool fullbuf = false;
+static int chunk = 0;                // 1-D passes run as contiguous batches of 'chunk' lines ("+chunkN")         // r2c writes / c2r reads the half spectrum inside a full-size array ("+full")
 
 template <typename T> static void scale(std::vector<std::complex<T>> &v, long long n) {
     if (scale_mode == "div") { for (auto &x : v) x = std::complex<T>(x.real() / (T)n, x.imag() / (T)n); return; }
@@ -205,6 +206,28 @@ template <typename T> static void transform(Arr<T> &a, char kind, const std::vec
         return;
     }
     to_complex(a);
+    if (chunk && td.size() == 1) {
+        // gather 'chunk' lines along dim d into a contiguous buffer, transform with plan_many, scatter back
+        int d = td[0];
+        long long n = a.shape[d], L = st[d], M = prod(a.shape) / (n * L), lines = L * M;
+        std::vector<std::complex<T>> buf(n * chunk), ob(n * chunk);
+        for (long long l0 = 0; l0 < lines; l0 += chunk) {
+            int h = (int)std::min<long long>(chunk, lines - l0);
+            for (int j = 0; j < h; j++) {
+                long long l = l0 + j, base = (l / L) * L * n + (l % L);
+                for (long long k = 0; k < n; k++) buf[j * n + k] = a.c[base + k * L];
+            }
+            typename A::dim dd; dd.n = n; dd.is = dd.os = 1;
+            typename A::dim hd; hd.n = h; hd.is = hd.os = n;
+            A::run(A::dft(1, &dd, 1, &hd, (typename A::cpx *)buf.data(), (typename A::cpx *)ob.data(), kind == 'F' ? FFTW_FORWARD : FFTW_BACKWARD));
+            for (int j = 0; j < h; j++) {
+                long long l = l0 + j, base = (l / L) * L * n + (l % L);
+                for (long long k = 0; k < n; k++) a.c[base + k * L] = ob[j * n + k];
+            }
+        }
+        if (kind == 'I') scale(a.c, n);
+        return;
+    }
     bool ip = inplace_later && pass_no++ > 0;
     std::vector<std::complex<T>> in = a.c, out(ip ? 0 : a.c.size());
     if (ip) out = in;
@@ -220,6 +243,7 @@ template <typename T> static void job(std::istringstream &ss, int ndim, Shape sh
     std::string inp, outp; int nt, nops; ss >> inp >> outp >> nt >> scale_mode >> nops;
     inplace_later = scale_mode.find("+ip") != std::string::npos;
     fullbuf = scale_mode.find("+full") != std::string::npos;
+    chunk = scale_mode.find("+chunk") != std::string::npos ? atoi(scale_mode.c_str() + scale_mode.find("+chunk") + 6) : 0;
     scale_mode = scale_mode.substr(0, scale_mode.find('+'));
     pass_no = 0;
     F<T>::threads(nt);
@@ -244,7 +268,7 @@ template <typename T> static void job(std::istringstream &ss, int ndim, Shape sh
         if (prod(a.shape) == 0) continue;
         bool rank = kind[0] == 'R';
         if (rank) transform(a, kd, dims);
-        else for (int d : dims) transform(a, kd, std::vector<int>{d});
+        else for (int d : dims) if (a.shape[d] > 1 || kd == 'S') transform(a, kd, std::vector<int>{d});
     }
     if (!a.real) {
         bool allz = true; for (auto &x : a.c) allz &= x.imag() == 0;

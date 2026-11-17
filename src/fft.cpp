@@ -13,6 +13,7 @@
  *   -DFFT_NO_THREADS   omit fftw_init_threads and the threaded solvers
  *   -DFFT_NO_SINGLE    omit the fftwf_ (float) library
  *   -DFFT_NO_DOUBLE    omit the fftw_ (double) library
+ *   -DFFT_NO_REODFT    omit the DCT/DST (REDFT/RODFT) r2r solvers
  *
  * The FFTW COPYRIGHT file follows verbatim.
  */
@@ -57810,7 +57811,9 @@ extern "C" void X(rdft_conf_standard)(planner *p)
      X(solvtab_exec)(s, p);
      X(solvtab_exec)(X(solvtab_rdft_r2cf), p);
      X(solvtab_exec)(X(solvtab_rdft_r2cb), p);
+#ifndef FFT_NO_REODFT
      X(solvtab_exec)(X(solvtab_rdft_r2r), p);
+#endif
 
 #if HAVE_SSE2
      if (X(have_simd_sse2)())
@@ -65570,6 +65573,9 @@ extern "C" const kr2c_genus GENUS = { HC2RIII, 1 };
 #undef GENUS
 
 /* ==== rdft/scalar/r2r.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f164_rdft_scalar_r2r {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -65619,6 +65625,9 @@ extern "C" const kr2r_genus GENUS;
 extern "C" const kr2r_genus GENUS = { 1 };
 }
 #undef GENUS
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== rdft/scalar/r2cf/codlist.c ==== */
 namespace f165_rdft_scalar_r2cf_codlist {
@@ -186249,6 +186258,9 @@ extern "C" void X(codelet_r2cb_9) (planner *p) { X(kr2c_register) (p, r2cb_9, &d
 #undef GENUS
 
 /* ==== rdft/scalar/r2r/codlist.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f341_rdft_scalar_r2r_codlist {
 
 
@@ -186263,8 +186275,14 @@ extern "C" const solvtab X(solvtab_rdft_r2r) = {
    SOLVTAB_END
 };
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== rdft/scalar/r2r/e01_8.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f342_rdft_scalar_r2r_e01_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -186500,8 +186518,14 @@ extern "C" void X(codelet_e01_8) (planner *p) { X(kr2r_register) (p, e01_8, &des
 #endif
 }
 #undef GENUS
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== rdft/scalar/r2r/e10_8.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f343_rdft_scalar_r2r_e10_8 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -186738,8 +186762,14 @@ extern "C" void X(codelet_e10_8) (planner *p) { X(kr2r_register) (p, e10_8, &des
 #endif
 }
 #undef GENUS
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/conf.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f344_reodft_conf {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -186829,8 +186859,14 @@ extern "C" void X(reodft_conf_standard)(planner *p)
      X(solvtab_exec)(s, p);
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/redft00e-r2hc-pad.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f345_reodft_redft00e_r2hc_pad {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -187029,8 +187065,14 @@ extern "C" void X(redft00e_r2hc_pad_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/reodft00e-splitradix.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f346_reodft_reodft00e_splitradix {
 /*
  * Copyright (c) 2005 Matteo Frigo
@@ -187386,8 +187428,14 @@ extern "C" void X(reodft00e_splitradix_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/reodft010e-r2hc.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f347_reodft_reodft010e_r2hc {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -187799,8 +187847,14 @@ extern "C" void X(reodft010e_r2hc_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/reodft11e-r2hc-odd.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f348_reodft_reodft11e_r2hc_odd {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -188103,8 +188157,14 @@ extern "C" void X(reodft11e_r2hc_odd_register)(planner *p)
 }
 }
 #undef SGN_SET
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/reodft11e-radix2.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f349_reodft_reodft11e_radix2 {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -188619,8 +188679,14 @@ extern "C" void X(reodft11e_radix2_r2hc_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== reodft/rodft00e-r2hc-pad.c ==== */
+}
+#ifndef FFT_NO_REODFT
+namespace FFT_PREC_NS {
 namespace f350_reodft_rodft00e_r2hc_pad {
 /*
  * Copyright (c) 2003, 2007-14 Matteo Frigo
@@ -188817,6 +188883,9 @@ extern "C" void X(rodft00e_r2hc_pad_register)(planner *p)
      REGISTER_SOLVER(p, mksolver());
 }
 }
+}
+#endif
+namespace FFT_PREC_NS {
 
 /* ==== api/apiplan.c ==== */
 namespace f351_api_apiplan {
@@ -189158,7 +189227,9 @@ extern "C" void X(configure_planner)(planner *plnr)
 {
      X(dft_conf_standard)(plnr);
      X(rdft_conf_standard)(plnr);
+#ifndef FFT_NO_REODFT
      X(reodft_conf_standard)(plnr);
+#endif
 }
 }
 
