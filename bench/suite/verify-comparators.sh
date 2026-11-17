@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Verify every comparator binary built by comparators.sh against the baseline harness on a case file.
 #
-#   bench/suite/verify-comparators.sh <outdir> [suite=bench/suite/frozen.txt] [threads="1 4"]
+#   [IDS="mkl ducc0-native ..."] [CASE_TIMEOUT=120] bench/suite/verify-comparators.sh <outdir> [suite=bench/suite/frozen.txt] [threads="1 4"]
 #
 # 1. harness equivalence: bin/fftchode (fftsuite.cpp + this repo's fft.o) and bin/fftchode-harness (adapters/harness.h + adapters/fftw.cpp on the
 #    same fft.o) must print identical --mode hash lines (same inputs, geometry, in/out-of-place and c2r input construction).
 # 2. accuracy: every bin/*-err (relative rms and max error against long-double upstream FFTW, fftsuite -DFFTSUITE_REF semantics) at each thread
 #    count; thresholds 1e-12 (double) and 1e-5 (single) relative rms.  Unsupported cases ("FAIL <reason>") are listed, not counted as errors.
+# Each case runs in its own process (--only) with a timeout (CASE_TIMEOUT seconds, default 120): a case that times out or crashes is reported as
+# "FAIL timeout/crash" (e.g. AOCL-FFTW built with --enable-amd-app-opt needs minutes to plan large sizes even with FFTW_ESTIMATE).
+# IDS restricts the run to the given binary ids (default: every bin/*-err).
 # Writes <outdir>/verify/<id>-t<N>.err and <outdir>/verify/summary.txt (also printed).  Exit status 1 if any case exceeds a threshold.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -16,10 +19,16 @@ V=$OUT/verify; mkdir -p "$V"
 "$OUT/bin/fftchode-harness" --suite "$SUITE" --threads 1 --mode hash > "$V/hash-harness.txt"
 if diff -q "$V/hash-fftsuite.txt" "$V/hash-harness.txt" >/dev/null; then echo "harness equivalence: OK ($(wc -l < "$V/hash-harness.txt") hash lines identical)"
 else echo "harness equivalence: MISMATCH"; diff "$V/hash-fftsuite.txt" "$V/hash-harness.txt" | head; exit 1; fi
+CT=${CASE_TIMEOUT:-120}
 for b in "$OUT"/bin/*-err; do
   id=$(basename "$b" -err)
+  case " ${IDS:-$id} " in *" $id "*) ;; *) continue;; esac
   for t in $THREADS; do
-    "$b" --suite "$SUITE" --threads "$t" --mode err > "$V/$id-t$t.err" 2> "$V/$id-t$t.stderr" || echo "WARNING: $id threads=$t exited non-zero (see $V/$id-t$t.stderr)"
+    : > "$V/$id-t$t.err"; : > "$V/$id-t$t.stderr"
+    while read -r name _; do
+      case "$name" in ""|"#"*) continue;; esac
+      timeout "$CT" "$b" --suite "$SUITE" --only "$name" --threads "$t" --mode err >> "$V/$id-t$t.err" 2>> "$V/$id-t$t.stderr" || echo "$name FAIL timeout/crash (exit $?, >${CT}s or signal)" >> "$V/$id-t$t.err"
+    done < "$SUITE"
   done
 done
 python3 -I - "$V" "$SUITE" <<'EOF' | tee "$V/summary.txt"

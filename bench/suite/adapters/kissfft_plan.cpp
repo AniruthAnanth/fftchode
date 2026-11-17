@@ -55,6 +55,6 @@ Plan *KISS_MAKE(const Case &c, const Geo &g, S *in, S *out, std::string &why) {
     p->di = g.v.is * (c.kind == "rf" ? 1 : 2); p->dout = g.v.os * (c.kind == "rb" ? 1 : 2);
     if (p->kind == 0) p->cfg = g.rank == 1 ? (void *)kiss_fft_alloc(dims[0], p->bwd, nullptr, nullptr) : (void *)kiss_fftnd_alloc(dims.data(), g.rank, p->bwd, nullptr, nullptr);
     else p->cfg = g.rank == 1 ? (void *)kiss_fftr_alloc(dims[0], p->bwd, nullptr, nullptr) : (void *)kiss_fftndr_alloc(dims.data(), g.rank, p->bwd, nullptr, nullptr);
-    if (!p->cfg) { why = "KissFFT: alloc failed"; return nullptr; }
+    if (!p->cfg) { why = p->kind != 0 && g.rank > 1 ? "KissFFT: kiss_fftndr_alloc rejects the problem (its integer-overflow guard fires for N-D real problems of this size)" : "KissFFT: alloc failed"; return nullptr; }
     return p.release();
 }

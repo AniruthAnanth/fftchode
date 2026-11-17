@@ -105,7 +105,7 @@ build_aocl() {
       --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 --enable-amd-opt \
       --disable-fortran --disable-shared --enable-static $extra "$@" CC="$GCC" AMD_ARCH=znver4 > configure.log 2>&1 \
     && for sd in $AOCL_SUBDIRS; do make -j"$JOBS" -C "$sd" || exit 1; done > make.log 2>&1 \
-    && make -j"$JOBS" libfftw3.la >> make.log 2>&1 && make install-libLTLIBRARIES install-pkgconfigDATA > install.log 2>&1 && make -C api install-includeHEADERS >> install.log 2>&1 ) || return 1
+    && make -j"$JOBS" libfftw3$([ "$prec" = s ] && echo f).la >> make.log 2>&1 && make install-libLTLIBRARIES install-pkgconfigDATA > install.log 2>&1 && make -C api install-includeHEADERS >> install.log 2>&1 ) || return 1
   [ -f "$I/$name-$prec/lib/libfftw3$([ "$prec" = s ] && echo f).a" ] || return 1
   prov "aocl $name-$prec: $D/amd-fftw/configure --prefix=... --enable-threads --with-combined-threads --enable-sse2 --enable-avx --enable-avx2 --enable-avx512 --enable-amd-opt --disable-fortran --disable-shared --enable-static $extra $* CC=$GCC AMD_ARCH=znver4; CFLAGS=$(grep -m1 '^CFLAGS =' "$B/$name-$prec/Makefile" | cut -d= -f2-)"
 }
@@ -200,11 +200,15 @@ hbuild() {
   echo "$id" >> "$B/ids.txt"
 }
 # FFTW-API libraries: fftsuite.cpp itself (bench/suite/build.sh) + <id>-estimate|measure|patient wrappers
-fftw_api() { # <id> <inst-d> <inst-s>
-  local id=$1 d=$2 s=$3 f
-  INC="$I/$d/include" REF="$I/fftw-ref-l/lib/libfftw3l.a" CC=$HCC CXX=$HCXX "$HERE/build.sh" "$BIN/$id" "$I/$d/lib/libfftw3.a" "$I/$s/lib/libfftw3f.a"
+fftw_api() { # <id> <inst-d> <inst-s> [extra link flags]
+  local id=$1 d=$2 s=$3 x=${4:-} f
+  INC="$I/$d/include" REF="$I/fftw-ref-l/lib/libfftw3l.a" CC=$HCC CXX=$HCXX "$HERE/build.sh" "$BIN/$id" "$I/$d/lib/libfftw3.a" "$I/$s/lib/libfftw3f.a" $x
   for f in estimate measure patient; do
-    printf '#!/bin/sh\nexec "$(dirname "$0")/%s" "$@" --plan %s\n' "$id" "$f" > "$BIN/$id-$f"; chmod +x "$BIN/$id-$f"
+    case $id in
+      aocl-app) printf '#!/bin/sh\nexec python3 -I "%s/case_timeout.py" "$(dirname "$0")/%s" "$@" --plan %s\n' "$HERE" "$id" "$f" > "$BIN/$id-$f";;  # per-case time limit, see case_timeout.py
+      *) printf '#!/bin/sh\nexec "$(dirname "$0")/%s" "$@" --plan %s\n' "$id" "$f" > "$BIN/$id-$f";;
+    esac
+    chmod +x "$BIN/$id-$f"
   done
   echo "$id (FFTW API; -estimate|-measure|-patient wrappers)" >> "$B/ids.txt"
 }
@@ -219,7 +223,8 @@ do_harness() {
   $HCXX "$B/obj/fftw-adapter.o" "$B/obj/memtrack_stub.o" "$REPO/build/fft.o" -pthread -lm -o "$BIN/fftchode-harness"
   have fftw || { echo "fftw step must run first" >&2; return 1; }
   fftw_api fftw-all fftw-all-d fftw-all-s; fftw_api fftw-avx2 fftw-avx2-d fftw-avx2-s
-  have aocl && { fftw_api aocl-app aocl-app-d aocl-app-s; fftw_api aocl-noapp aocl-noapp-d aocl-noapp-s; }
+  # AOCL's libfftw3.a and libfftw3f.a both define the un-prefixed global wisdom_write_set (a flag; wisdom is unused here): allow the duplicate
+  have aocl && { fftw_api aocl-app aocl-app-d aocl-app-s -Wl,--allow-multiple-definition; fftw_api aocl-noapp aocl-noapp-d aocl-noapp-s -Wl,--allow-multiple-definition; }
   if have mkl; then
     local M=$OUT/mklvenv
     hbuild mkl mkl.cpp "-O2 -I$M/include" "-Wl,--start-group $M/lib/libmkl_intel_lp64.a $M/lib/libmkl_intel_thread.a $M/lib/libmkl_core.a -Wl,--end-group $M/lib/libiomp5.a"

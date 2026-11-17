@@ -47,3 +47,12 @@ execution is untimed so the cache is warm); FFTE: coefficient table.
   The float library is built with symbol renames (kissf_rename.h) so both precisions live in one executable.
 - FFTE 7.0: 1-D complex double only, N = 2^a 3^b 5^c, in place: out-of-place cases transform the output buffer in place (the input is copied in before each timed batch,
   not inside it; values grow within a batch, harmless on x86). FFTE's inverse divides by N, the adapter multiplies by N again (one extra O(N) pass in cb cases).
+- AOCL-FFTW: both archives (libfftw3.a, libfftw3f.a) define the un-prefixed global `wisdom_write_set`; the harness links with `-Wl,--allow-multiple-definition` (a flag; harmless).
+  `aocl-app` (`--enable-amd-app-opt`) plans with a search in every planner mode, including FFTW_ESTIMATE: seconds for the first plan of a problem class at 256-16384 points,
+  minutes to hours from 64k points up (37 of 128 frozen cases did not finish in 20 s). Its `-estimate|-measure|-patient` wrappers therefore run each case in its own process through
+  `bench/suite/case_timeout.py` (CASE_TIMEOUT seconds per case, default 120; a timeout prints `FAIL timeout>Ns`); plan_s is then the cold first-plan cost of each case. It also reads/writes FFTW wisdom in `wis.dat` in the current directory (so plan_s depends on a leftover file; the wrapper uses a fresh temporary directory per case, `CASE_CWD=DIR` keeps wisdom). Its execution is
+  clearly faster than FFTW/aocl-noapp where it plans (d_cf1024 1.2 us vs 1.9 us, d_cf16384 35 us vs 65 us in a loaded smoke run), so decide the time limit knowingly.
+- MKL on this CPU (AMD EPYC Zen 4, family 25): MKL 2026.2.1 (also 2024.2.2 and 2022.2.1) runs its generic SSE2 DFTI kernels (`mkl_dft_def_*`, xmm registers), MKL_VERBOSE prints "Intel(R) Architecture
+  processors", and none of MKL_ENABLE_INSTRUCTIONS=AVX2|AVX512|SSE4_2, MKL_DEBUG_CPU_TYPE=5, MKL_CBWR=AVX2|AVX512|COMPATIBLE or mkl_enable_instructions() changes the kernel or the speed
+  (reproduce with adapters/mkl_probe.sh). MKL numbers are therefore SSE2-class on the target machine.
+- pocketfft / ducc0 `--mode mem`: plan caches are filled by the first execution, so "live after plan" excludes them; the peak column includes them.
