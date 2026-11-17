@@ -638,6 +638,52 @@ static int fftchode_simd_allowed(const char *isa)
 }
 #endif
 
+#define FFTCHODE_FCW_INIT { 1, 1.74, 1.5, 1.81, 4.85, 37.2, 44.1, 1.03, 1, 0.897, 0.844, 1, 0.352, 1.12, 0.961, 0.719, 0.99, 0.742, 0.802, 0.672, 1.3, 1.28, 1.2, 0.899, 0.55, 0.98, 0.25, 1.21, 7.2, 4.77, 0.493, 0.25, 1.21, 1.48, 5.79, 0.141 }
+/* ==== fftchode fast-mode ESTIMATE planner (opt/planner, FFTE-6) ====
+ * In fast mode FFTW_ESTIMATE searches every applicable plan (no pruning) and
+ * ranks them with a cost that adds a memory-traffic and codelet-efficiency
+ * model to FFTW's operation count (see X(fc_mem), X(fc_loop), X(fc_arith)).
+ * The weights were fitted offline on this CPU class (bench/planner/calibrate.sh)
+ * on problem sizes outside the frozen suite.  Index: 0 arithmetic outside
+ * codelets, 1 FFTW's "other" ops (copies), 2-5 cache lines fetched from
+ * L1/L2/L3/DRAM, 6 child-plan calls in loops, 7-34 codelet arithmetic by
+ * register width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1
+ * real), 35 extra for codelets of radix > 16.
+ * Building with -DFFTCHODE_PLANNER_CALIBRATE reads FFTCHODE_PLANW (36
+ * comma-separated weights) and FFTCHODE_PLANRAND
+ * (sigma,seed: random cost perturbation for sampling plans). */
+static const double fftchode_fcw_default[36] = FFTCHODE_FCW_INIT;
+#ifdef FFTCHODE_PLANNER_CALIBRATE
+#include <cmath>
+static double fftchode_fcw_[36];
+static double fftchode_rand_[2];
+static int fftchode_fcw_init_ = 0;
+static void fftchode_fcw_load(void)
+{
+     const char *e = std::getenv("FFTCHODE_PLANW"), *r = std::getenv("FFTCHODE_PLANRAND");
+     int i;
+     for (i = 0; i < 36; ++i) fftchode_fcw_[i] = fftchode_fcw_default[i];
+     for (i = 0; e && *e && i < 36; ++i) {
+          char *q; double x = std::strtod(e, &q);
+          if (q == e) break;
+          fftchode_fcw_[i] = x; e = (*q == ',') ? q + 1 : q;
+     }
+     for (i = 0; r && *r && i < 2; ++i) {
+          char *q; double x = std::strtod(r, &q);
+          if (q == r) break;
+          fftchode_rand_[i] = x; r = (*q == ',') ? q + 1 : q;
+     }
+     fftchode_fcw_init_ = 1;
+}
+static const double *fftchode_fcw(void)
+{
+     if (!fftchode_fcw_init_) fftchode_fcw_load();
+     return fftchode_fcw_;
+}
+#else
+static const double *fftchode_fcw(void) { return fftchode_fcw_default; }
+#endif
+
 #define FFT_CPP_INNER 1
 #ifndef FFT_NO_DOUBLE
 #define FFT_PREC_NS fftw_amalgamation_double
@@ -1499,6 +1545,11 @@ typedef struct {
      double mul;
      double fma;
      double other;
+     /* fftchode fast mode: [0-3] cache lines fetched from L1, L2, L3, DRAM;
+        [4] child-plan calls in loops; [5-32] codelet arithmetic by register
+        width (scalar, 128, 256, 512 bits) x family (n1 n2 t1 t2 t3 q1 real);
+        [33] arithmetic of codelets with radix > 16 */
+     double fcl[34];
 } opcnt;
 
 extern "C" void X(ops_zero)(opcnt *dst);
@@ -1577,6 +1628,9 @@ typedef struct {
      iodim *dims;
 #endif
 } tensor;
+extern "C" void X(fc_mem)(opcnt *o, double k, INT n, INT s, INT v, INT vs, INT esz, INT vv, INT vvs);
+extern "C" void X(fc_loop)(opcnt *o, const tensor *sz, const tensor *vecsz, int vdim, INT esz);
+extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT gvl, const opcnt *c);
 
 /*
   Definition of rank -infinity.
@@ -3510,7 +3564,9 @@ namespace f018_kernel_ops {
 
 extern "C" void X(ops_zero)(opcnt *dst)
 {
+     int i;
      dst->add = dst->mul = dst->fma = dst->other = 0;
+     for (i = 0; i < 34; ++i) dst->fcl[i] = 0;
 }
 
 extern "C" void X(ops_cpy)(const opcnt *src, opcnt *dst)
@@ -3530,6 +3586,116 @@ extern "C" void X(ops_madd)(INT m, const opcnt *a, const opcnt *b, opcnt *dst)
      dst->mul = m * a->mul + b->mul;
      dst->fma = m * a->fma + b->fma;
      dst->other = m * a->other + b->other;
+     {
+          int i;
+          for (i = 0; i < 34; ++i) dst->fcl[i] = m * a->fcl[i] + b->fcl[i];
+     }
+}
+
+/* fftchode fast-mode cost model.  Cache levels: L1 32 KiB (8-way, 64 sets),
+   L2 1 MiB, L3 32 MiB, then DRAM; 64-byte lines. */
+static int fc_level(double span)
+{
+     return span <= 32768.0 ? 0 : span <= 1048576.0 ? 1 : span <= 33554432.0 ? 2 : 3;
+}
+static INT fc_gcd(INT a, INT b) { while (b) { INT t = a % b; a = b; b = t; } return a; }
+
+/* Memory traffic of a kernel that loops vv times (stride vvs) over v times
+   (stride vs) over n elements (stride s, innermost) of esz bytes; strides in
+   units of R.  Adds k times the 64-byte lines it fetches to the bucket of the
+   level that holds the kernel's address span.  A line serves several elements
+   when the inner stride is below a line, or when the outer stride is and the n
+   lines in flight survive in L1: a power-of-two stride maps them to few sets. */
+extern "C" void X(fc_mem)(opcnt *o, double k, INT n, INT s, INT v, INT vs, INT esz, INT vv, INT vvs)
+{
+     const double L = 64.0;
+     double b1, b2, b3, g, span;
+     if (n <= 1) { n = v; s = vs; v = 1; vs = 0; }
+     if (n <= 1) { n = vv; s = vvs; vv = 1; vvs = 0; }
+     if (n < 1) n = 1;
+     if (v < 1) v = 1;
+     if (vv < 1) vv = 1;
+     b1 = (double)X(iabs)(s) * sizeof(R);
+     b2 = (double)X(iabs)(vs) * sizeof(R);
+     b3 = (double)X(iabs)(vvs) * sizeof(R);
+     if (b1 < L)
+          g = b1 > esz ? b1 : esz;
+     else {
+          INT q = (INT)(b1 / L), sets = 64;
+          if ((double)q * L == b1) sets = 64 / fc_gcd(q, 64);
+          if (v > 1 && b2 < L && n <= 4 * sets)
+               g = b2 > esz ? b2 : esz;
+          else
+               g = L;
+     }
+     span = (n - 1) * b1 + (v - 1) * b2 + (vv - 1) * b3 + esz;
+     o->fcl[fc_level(span)] += k * (double)n * (double)v * (double)vv * g / L;
+}
+
+/* A loop of calls to a child plan over dimension vdim of vecsz.  The first
+   touch of each iteration's data comes from the level that holds the whole
+   loop's span, not the child's, so one dense pass over the child's input and
+   output moves to that level.  Also counts the calls. */
+static double fc_tspan(const tensor *t, int skip, int out, double *nel)
+{
+     double sp = 0;
+     int k;
+     for (k = 0; k < t->rnk; ++k) {
+          if (k == skip) continue;
+          *nel *= t->dims[k].n;
+          sp += (double)(t->dims[k].n - 1) * (double)X(iabs)(out ? t->dims[k].os : t->dims[k].is);
+     }
+     return sp;
+}
+extern "C" void X(fc_loop)(opcnt *o, const tensor *sz, const tensor *vecsz, int vdim, INT esz)
+{
+     const iodim *d = vecsz->dims + vdim;
+     int out;
+     for (out = 0; out < 2; ++out) {
+          double nel = 1, sp, f;
+          int lc, lt;
+          sp = (fc_tspan(sz, -1, out, &nel) + fc_tspan(vecsz, vdim, out, &nel)) * sizeof(R) + esz;
+          lc = fc_level(sp);
+          lt = fc_level(sp + (double)(d->n - 1) * (double)X(iabs)(out ? d->os : d->is) * sizeof(R));
+          f = (double)d->n * nel * esz / 64.0;
+          if (lt > lc) { o->fcl[lt] += f; o->fcl[lc] -= f; }
+     }
+     o->fcl[4] += d->n;
+}
+
+/* A leaf that calls a codelet (name nam, ops c, radix r, SIMD vector length
+   gvl) on v * cnt transforms.  FFTW counts v * (cnt / gvl) calls, so a SIMD
+   codelet run on fewer than gvl transforms looks free; charge the partial
+   vector call too.  The codelet's arithmetic is bucketed by register width
+   (scalar, 128, 256, 512 bits: an operation costs more on wider registers when
+   the core splits them, as Zen 4 does for 512 bits) and by codelet family (n1,
+   n2, t1, t2, t3, q1, real), and codelets of radix > 16 (which spill registers)
+   get an extra term. */
+static int fc_width(const char *nam)
+{
+     const char *u = strrchr(nam, '_');
+     if (!u) return 0;
+     ++u;
+     if (!strcmp(u, "avx512") || !strcmp(u, "kcvi")) return 3;
+     if (!strcmp(u, "avx") || !strcmp(u, "avx2")) return 2;
+     if (!strcmp(u, "sse2") || !strcmp(u, "128") || !strcmp(u, "fma") || !strcmp(u, "neon")
+         || !strcmp(u, "altivec") || !strcmp(u, "vsx")) return 1;
+     return 0;
+}
+static int fc_family(const char *nam)
+{
+     if (nam[0] == 'n') return nam[1] == '2' ? 1 : 0;
+     if (nam[0] == 't') return nam[1] == '2' ? 3 : nam[1] == '3' ? 4 : 2;
+     if (nam[0] == 'q') return 5;
+     return 6;
+}
+extern "C" void X(fc_vops)(opcnt *o, const char *nam, INT r, INT v, INT cnt, INT gvl, const opcnt *c)
+{
+     INT k = v * ((cnt + gvl - 1) / gvl);
+     double a = k * (c->add + c->mul + 2 * c->fma);
+     X(ops_madd2)(k - v * (cnt / gvl), c, o);
+     o->fcl[5 + 7 * fc_width(nam) + fc_family(nam)] += a;
+     if (r > 16) o->fcl[33] += a;
 }
 
 extern "C" void X(ops_add)(const opcnt *a, const opcnt *b, opcnt *dst)
@@ -4151,6 +4317,26 @@ extern "C" double X(iestimate_cost)(const planner *ego, const plan *pln, const p
 #endif
 	  
 	  + pln->ops.other;
+     if (::fftchode_numerics_mode()) {
+          const double *w = ::fftchode_fcw(), *l = pln->ops.fcl;
+          int i;
+          cost -= pln->ops.other;
+          for (i = 5; i < 33; ++i) cost -= l[i];
+          cost = w[0] * cost + w[1] * pln->ops.other;
+          for (i = 0; i < 34; ++i) cost += w[2 + i] * l[i];
+#ifdef FFTCHODE_PLANNER_CALIBRATE
+          if (::fftchode_rand_[0] > 0) {
+               md5 m;
+               X(md5begin)(&m);
+               X(md5unsigned)(&m, (unsigned)::fftchode_rand_[1]);
+               p->adt->hash(p, &m);
+               X(md5putb)(&m, &pln->ops, sizeof(pln->ops));
+               X(md5putb)(&m, &pln->adt, sizeof(pln->adt));
+               X(md5end)(&m);
+               cost *= std::exp(::fftchode_rand_[0] * (2.0 * (double)(m.s[0] & 0xffffff) / 16777216.0 - 1.0));
+          }
+#endif
+     }
      if (ego->cost_hook)
 	  cost = ego->cost_hook(p, cost, COST_MAX);
      return cost;
@@ -9563,6 +9749,11 @@ static plan *mkcldw(const ct_solver *ego_,
 	  /* 8 load/stores * N * V */
 	  pln->super.super.ops.other += 8 * r * mcount * v;
      }
+     if (::fftchode_numerics_mode()) {
+	  X(fc_mem)(&pln->super.super.ops, 2, r, irs, mcount, ms, 2 * sizeof(R), v, ivs);
+	  X(fc_mem)(&pln->super.super.ops, v, X(twiddle_length)(r, e->tw) * mcount, 1, 1, 0, sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, e->nam, r, v, mcount, e->genus->vl, &e->ops);
+     }
 
      pln->super.super.could_prune_now_p =
 	  (!ego->bufferedp && r >= 5 && r < 64 && m >= r);
@@ -9733,6 +9924,11 @@ static plan *mkcldw(const ct_solver *ego_,
 
      X(ops_zero)(&pln->super.super.ops);
      X(ops_madd2)(mcount/e->genus->vl, &e->ops, &pln->super.super.ops);
+     if (::fftchode_numerics_mode()) {
+	  X(fc_mem)(&pln->super.super.ops, 2, r, irs, mcount, ms, 2 * sizeof(R), v, ivs);
+	  X(fc_mem)(&pln->super.super.ops, 1, X(twiddle_length)(r, e->tw) * mcount, 1, 1, 0, sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, e->nam, r, 1, mcount, e->genus->vl, &e->ops);
+     }
 
      return &(pln->super.super);
 }
@@ -9942,6 +10138,10 @@ static plan *mkcldw(const ct_solver *ego_,
 	  pln->super.super.ops.mul += 8 * n0;
 	  pln->super.super.ops.add += 4 * n0;
 	  pln->super.super.ops.other += 8 * n0;
+	  if (::fftchode_numerics_mode()) {
+	       X(fc_mem)(&pln->super.super.ops, 2, r, irs, mcount, ms, 2 * sizeof(R), v, ivs);
+	       X(fc_mem)(&pln->super.super.ops, v, 2 * r * mcount, 1, 1, 0, sizeof(R), 1, 0);
+	  }
      }
      return &(pln->super.super);
 
@@ -10167,6 +10367,10 @@ static plan *mkcldw(const ct_solver *ego_,
 	  pln->super.super.ops.mul += 8 * n0;
 	  pln->super.super.ops.add += 4 * n0;
 	  pln->super.super.ops.other += 8 * n0;
+	  if (::fftchode_numerics_mode()) {
+	       X(fc_mem)(&pln->super.super.ops, 2, r, irs, mcount, ms, 2 * sizeof(R), 1, 0);
+	       X(fc_mem)(&pln->super.super.ops, 1, 2 * r * mcount, 1, 1, 0, sizeof(R), 1, 0);
+	  }
      }
      return &(pln->super.super);
 
@@ -10472,6 +10676,11 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      if (ego->bufferedp) 
 	  pln->super.super.ops.other += 4 * pln->n * pln->vl;
+     if (::fftchode_numerics_mode()) {
+	  X(fc_mem)(&pln->super.super.ops, 1, pln->n, d[0].is, pln->vl, pln->ivs, 2 * sizeof(R), 1, 0);
+	  X(fc_mem)(&pln->super.super.ops, 1, pln->n, d[0].os, pln->vl, pln->ovs, 2 * sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, e->nam, pln->n, 1, pln->vl, e->genus->vl, &e->ops);
+     }
 
      pln->super.super.could_prune_now_p = !ego->bufferedp;
      return &(pln->super.super);
@@ -12276,6 +12485,8 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      X(ops_zero)(&pln->super.super.ops);
      pln->super.super.ops.other = 3.14159; /* magic to prefer codelet loops */
      X(ops_madd2)(pln->vl, &cld->ops, &pln->super.super.ops);
+     if (::fftchode_numerics_mode())
+	  X(fc_loop)(&pln->super.super.ops, p->sz, p->vecsz, vdim, 2 * sizeof(R));
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 64))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
@@ -58391,6 +58602,11 @@ static plan *mkcldw(const hc2c_solver *ego_, rdft_kind kind,
 
      if (ego->bufferedp) 
 	  pln->super.super.ops.other += 4 * r * m * v;
+     if (::fftchode_numerics_mode()) {
+	  X(fc_mem)(&pln->super.super.ops, 2, r, rs, m, ms, 2 * sizeof(R), v, vs);
+	  X(fc_mem)(&pln->super.super.ops, v, X(twiddle_length)(r, e->tw) * ((m - 1) / 2), 1, 1, 0, sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, e->nam, r, v, (m - 1) / 2, e->genus->vl, &e->ops);
+     }
 
      return &(pln->super.super);
 
@@ -59768,6 +59984,13 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      if (ego->bufferedp) 
 	  pln->super.super.ops.other += 2 * n * pln->vl;
+     if (::fftchode_numerics_mode()) {
+	  INT rvs = R2HC_KINDP(p->kind[0]) ? pln->ivs : pln->ovs;
+	  INT cvs = R2HC_KINDP(p->kind[0]) ? pln->ovs : pln->ivs;
+	  X(fc_mem)(&pln->super.super.ops, 1, n, rs, pln->vl, rvs, sizeof(R), 1, 0);
+	  X(fc_mem)(&pln->super.super.ops, 1, n, cs, pln->vl, cvs, sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, ego->desc->nam, n, 1, pln->vl, ego->desc->genus->vl, &ego->desc->ops);
+     }
 
      pln->super.super.could_prune_now_p = !ego->bufferedp;
 
@@ -60102,6 +60325,13 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 		  &pln->super.super.ops);
      if (p->kind == R2HC)
 	  pln->super.super.ops.other += 2 * pln->vl; /* + 2 stores */
+     if (::fftchode_numerics_mode()) {
+	  INT rvs = r2hc_kindp ? pln->ivs : pln->ovs;
+	  INT cvs = r2hc_kindp ? pln->ovs : pln->ivs;
+	  X(fc_mem)(&pln->super.super.ops, 1, d->n, r2hc_kindp ? d->is : d->os, pln->vl, rvs, sizeof(R), 1, 0);
+	  X(fc_mem)(&pln->super.super.ops, 1, d->n / 2 + 1, r2hc_kindp ? d->os : d->is, pln->vl, cvs, 2 * sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, ego->desc->nam, d->n, 1, pln->vl, ego->desc->genus->vl, &ego->desc->ops);
+     }
 
      pln->super.super.could_prune_now_p = 1;
      return &(pln->super.super);
@@ -60654,6 +60884,11 @@ static plan *mkcldw(const hc2hc_solver *ego_,
 
      if (ego->bufferedp) 
 	  pln->super.super.ops.other += 4 * r * (pln->me - pln->mb) * v;
+     if (::fftchode_numerics_mode()) {
+	  X(fc_mem)(&pln->super.super.ops, 2, r, rs, pln->me - pln->mb, ms, sizeof(R), v, vs);
+	  X(fc_mem)(&pln->super.super.ops, v, X(twiddle_length)(r, e->tw) * (pln->me - pln->mb), 1, 1, 0, sizeof(R), 1, 0);
+	  X(fc_vops)(&pln->super.super.ops, e->nam, r, v, pln->me - pln->mb, e->genus->vl, &e->ops);
+     }
 
      pln->super.super.could_prune_now_p =
 	  (!ego->bufferedp && r >= 5 && r < 64 && m >= r);
@@ -63316,6 +63551,37 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      /* X(tensor_sz)(p->vecsz) loads, X(tensor_sz)(p->vecsz) stores */
      X(ops_other)(2 * X(tensor_sz)(p->vecsz), &pln->super.super.ops);
+     if (::fftchode_numerics_mode()) {
+	  rdftapply a = ego->apply;
+	  opcnt *o = &pln->super.super.ops;
+	  INT esz = pln->vl * (INT)sizeof(R), nall = X(tensor_sz)(p->vecsz) / pln->vl;
+	  if (pln->rnk == 0)
+	       X(fc_mem)(o, 2, pln->vl, 1, 1, 0, sizeof(R), 1, 0);
+	  else if (a == apply_tiled || a == apply_tiledbuf
+		   || a == apply_ip_sq_tiled || a == apply_ip_sq_tiledbuf)
+	       X(fc_mem)(o, (a == apply_tiled || a == apply_tiledbuf) ? 2 : 4,
+			 nall * pln->vl, 1, 1, 0, sizeof(R), 1, 0);
+	  else {
+	       /* innermost loop: smallest input stride (iter-ci, ip-sq), smallest
+		  output stride (iter-co), or the last dimension (memcpy-loop) */
+	       int side, k, ki = pln->rnk - 1, ko;
+	       for (k = 0; k < pln->rnk; ++k) {
+		    INT sk = (a == apply_cpy2dco) ? pln->d[k].os : pln->d[k].is;
+		    INT si = (a == apply_cpy2dco) ? pln->d[ki].os : pln->d[ki].is;
+		    if (a != apply_memcpy_loop && X(iabs)(sk) < X(iabs)(si)) ki = k;
+	       }
+	       for (side = 0; side < 2; ++side) {
+		    INT si = side ? pln->d[ki].os : pln->d[ki].is, so = 0;
+		    ko = -1;
+		    for (k = 0; k < pln->rnk; ++k) {
+			 INT sk = side ? pln->d[k].os : pln->d[k].is;
+			 if (k != ki && (ko < 0 || X(iabs)(sk) < X(iabs)(so))) { ko = k; so = sk; }
+		    }
+		    X(fc_mem)(o, a == apply_ip_sq ? 2 : 1, pln->d[ki].n, si,
+			      nall / pln->d[ki].n, so, esz, 1, 0);
+	       }
+	  }
+     }
      return &(pln->super.super);
 }
 
@@ -64329,6 +64595,8 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      X(ops_zero)(&pln->super.super.ops);
      pln->super.super.ops.other = 3.14159; /* magic to prefer codelet loops */
      X(ops_madd2)(pln->vl, &cld->ops, &pln->super.super.ops);
+     if (::fftchode_numerics_mode())
+	  X(fc_loop)(&pln->super.super.ops, p->sz, p->vecsz, vdim, sizeof(R));
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 128))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
@@ -64550,6 +64818,8 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      X(ops_zero)(&pln->super.super.ops);
      pln->super.super.ops.other = 3.14159; /* magic to prefer codelet loops */
      X(ops_madd2)(pln->vl, &cld->ops, &pln->super.super.ops);
+     if (::fftchode_numerics_mode())
+	  X(fc_loop)(&pln->super.super.ops, p->sz, p->vecsz, vdim, sizeof(R));
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 128))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
@@ -192288,6 +192558,15 @@ extern "C" double X(estimate_cost)(const X(plan) p)
 {
      return X(iestimate_cost)(X(the_planner)(), p->pln, p->prb);
 }
+#ifdef FFTCHODE_PLANNER_CALIBRATE
+extern "C" void X(fc_dev_ops)(const X(plan) p, double *o)
+{
+     const opcnt *c = &p->pln->ops;
+     int i;
+     o[0] = c->add; o[1] = c->mul; o[2] = c->fma; o[3] = c->other;
+     for (i = 0; i < 34; ++i) o[4 + i] = c->fcl[i];
+}
+#endif
 
 extern "C" double X(cost)(const X(plan) p)
 {
@@ -192829,6 +193108,11 @@ extern "C" void X(mapflags)(planner *plnr, unsigned flags)
      };
 
      map_flags(&flags, &flags, self_flagmap, NELEM(self_flagmap));
+
+     /* fast mode: ESTIMATE ranks every applicable plan instead of stopping
+        at the first one marked could_prune_now_p */
+     if ((flags & FFTW_ESTIMATE) && ::fftchode_numerics_mode())
+          flags &= ~FFTW_ALLOW_PRUNING;
 
      l = u = 0;
      map_flags(&flags, &l, l_flagmap, NELEM(l_flagmap));
@@ -306348,6 +306632,9 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      pln->super.super.ops.add += (double)(npairs / VL) * (n / 2 + 1) * 3;
      pln->super.super.ops.mul += (double)(npairs / VL) * (n / 2 + 1) * 2;
      pln->super.super.ops.other += (double)(npairs / VL) * (2 * n * (pln->simd ? 1 : VL) + 4 * (n / 2 + 1));
+     /* fast-mode cost model: real side n points x 2 b2 columns, complex side n/2+1 x 2 b2 */
+     X(fc_mem)(&pln->super.super.ops, 1, 2 * b2, rv, n, rs, sizeof(R), npairs / b2, 2 * b2 * rv);
+     X(fc_mem)(&pln->super.super.ops, 1, 2 * b2, cv, n / 2 + 1, cs, 2 * sizeof(R), npairs / b2, 2 * b2 * cv);
      return &(pln->super.super);
 
  nada:
@@ -306572,6 +306859,9 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
      X(ops_add2)(&cldrest->ops, &pln->super.super.ops);
      /* per VL columns and point: a load and a store in each direction */
      pln->super.super.ops.other += (double)(ncols / VL) * n * 4;
+     /* fast-mode cost model: pack reads b adjacent columns per point, unpack writes them */
+     X(fc_mem)(&pln->super.super.ops, 1, b, 2, n, is, 2 * sizeof(R), ncols / b, 2 * b);
+     X(fc_mem)(&pln->super.super.ops, 1, b, 2, n, os, 2 * sizeof(R), ncols / b, 2 * b);
      return &(pln->super.super);
 
  nada:
