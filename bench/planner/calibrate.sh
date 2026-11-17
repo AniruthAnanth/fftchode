@@ -5,7 +5,7 @@
 #      ROUNDS=<interleaved timing rounds, default 7>, SRC=<fft.cpp to calibrate, default src/fft.cpp>.
 # Builds fft.cpp with -DFFTCHODE_PLANNER_CALIBRATE, samples ~26 plans per training case (fast
 # ESTIMATE, fast MEASURE and ESTIMATE with randomly perturbed costs), times every distinct plan
-# interleaved, and fits the 36 weights by NNLS (fit.py, NEAR=1).  Takes a few hours for the
+# interleaved, and fits the 36 weights by NNLS (fit.py, NEAR=1).  Takes about 15 min on one core for the
 # shipped 124-case training set.  The training cases exclude every frozen-suite shape
 # (gen_train.py); never calibrate on the frozen suite.
 set -euo pipefail
