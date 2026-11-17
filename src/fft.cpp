@@ -12112,7 +12112,32 @@ typedef struct {
      INT vl;
      INT ivs, ovs;
      const S *solver;
+
+     /* fftchode column buffering: the child is an n-point transform with
+	large strides is/os and adjacent transforms are one complex apart
+	(MATLAB fft along dimension 2, the column passes of rank>=2 plans).
+	When awake, shadow is the same plan structure for the transform
+	written to a contiguous buffer, so that nb adjacent transforms are
+	computed with whole cache lines and every pass but the first stays
+	in cache.  Identical structure means identical arithmetic. */
+     INT n, is, os, nb, bd;
+     int inplace;
+     plan *shadow;
 } P;
+
+#define COLBUF_LINE 64
+#ifndef FFTCHODE_COLBUF_MIN
+#define FFTCHODE_COLBUF_MIN ((INT)256 * 1024)
+#endif
+
+/* lines of a 32 KiB 8-way L1 (64-byte lines) that a column with this byte
+   stride can occupy: power-of-two strides map to few sets */
+static INT l1_lines_at_stride(INT s)
+{
+     INT a = 4096, b = s, t;
+     while (b) { t = a % b; a = b; b = t; }
+     return 8 * (4096 / (a > COLBUF_LINE ? a : COLBUF_LINE));
+}
 
 static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 {
@@ -12121,21 +12146,140 @@ static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
      INT ivs = ego->ivs, ovs = ego->ovs;
      dftapply cldapply = ((plan_dft *) ego->cld)->apply;
 
-     for (i = 0; i < vl; ++i) {
+     i = 0;
+     if (ego->shadow) {
+	  INT j, k, n = ego->n, is = ego->is, os = ego->os;
+	  INT nb = ego->nb, bd = ego->bd;
+	  size_t bufsz = sizeof(R) * 2 * nb * bd;
+	  dftapply shapply = ((plan_dft *) ego->shadow)->apply;
+	  R *buf;
+
+	  BUF_ALLOC(R *, buf, bufsz);
+	  for (; i + nb <= vl; i += nb) {
+	       const R *xr = ri + i * ivs, *xi = ii + i * ivs;
+	       R *yr = ro + i * ovs, *yi = io + i * ovs;
+	       if (ego->inplace) {
+		    for (k = 0; k < n; ++k)
+			 for (j = 0; j < nb; ++j) {
+			      buf[2 * (j * bd + k)] = xr[k * is + j * ivs];
+			      buf[2 * (j * bd + k) + 1] = xi[k * is + j * ivs];
+			 }
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, buf + 2 * j * bd, buf + 2 * j * bd + 1,
+				 buf + 2 * j * bd, buf + 2 * j * bd + 1);
+	       } else {
+		    for (j = 0; j < nb; ++j)
+			 shapply(ego->shadow, ri + (i + j) * ivs, ii + (i + j) * ivs,
+				 buf + 2 * j * bd, buf + 2 * j * bd + 1);
+	       }
+	       for (k = 0; k < n; ++k)
+		    for (j = 0; j < nb; ++j) {
+			 yr[k * os + j * ovs] = buf[2 * (j * bd + k)];
+			 yi[k * os + j * ovs] = buf[2 * (j * bd + k) + 1];
+		    }
+	  }
+	  BUF_FREE(buf, bufsz);
+     }
+
+     for (; i < vl; ++i) {
           cldapply(ego->cld,
                    ri + i * ivs, ii + i * ivs, ro + i * ovs, io + i * ovs);
      }
+}
+
+extern "C" printer *X(mkprinter_cnt)(size_t *cnt);
+extern "C" printer *X(mkprinter_str)(char *s);
+extern "C" planner *X(the_planner)(void);
+
+/* plan printout without the parts that only describe data movement:
+   "directbuf/<k>-" is "direct-" with a copy, "/is=<k>", "/os=<k>" are strides */
+static char *structure_of(plan *pln)
+{
+     size_t cnt = 0;
+     char *s, *d;
+     const char *q;
+     printer *pr = X(mkprinter_cnt)(&cnt);
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     s = (char *) MALLOC(cnt + 1, OTHER);
+     pr = X(mkprinter_str)(s);
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     for (q = d = s; *q; ) {
+	  if (!strncmp(q, "directbuf/", 10)) {
+	       q += 10;
+	       while (*q >= '0' && *q <= '9') ++q;
+	       if (*q == '-') ++q;
+	       memcpy(d, "direct-", 7); d += 7;
+	  } else if (!strncmp(q, "/is=", 4) || !strncmp(q, "/os=", 4)) {
+	       q += 4;
+	       if (*q == '-') ++q;
+	       while (*q >= '0' && *q <= '9') ++q;
+	  } else
+	       *d++ = *q++;
+     }
+     *d = 0;
+     return s;
+}
+
+static plan *mkshadow(const P *ego, enum wakefulness wakefulness)
+{
+     planner *plnr = X(the_planner)();
+     flags_t flags = plnr->flags;
+     int nthr = plnr->nthr;
+     size_t sz = sizeof(R) * 2 * (size_t)ego->n * (size_t)(ego->is > 2 ? ego->is : 2);
+     R *in, *out;
+     plan *sh;
+
+     if (!ESTIMATEP(plnr) || plnr->wisdom_state != WISDOM_NORMAL)
+	  return 0;
+     in = X(plan_scratch)(plnr, sz);
+     out = ego->inplace ? in : X(plan_scratch)(plnr, sizeof(R) * 2 * ego->n);
+     /* unblessed and single-threaded: the shadow never reaches exported
+	wisdom (FORGET_ACCURSED drops it after planning) */
+     plnr->flags.hash_info = 0;
+     plnr->nthr = 1;
+     sh = X(mkplan_d)(plnr,
+		      X(mkproblem_dft_d)(
+			   X(mktensor_1d)(ego->n, ego->inplace ? 2 : ego->is, 2),
+			   X(mktensor_0d)(),
+			   in, in + 1, out, out + 1));
+     plnr->flags = flags;
+     plnr->nthr = nthr;
+     if (!ego->inplace) X(plan_scratch_free)(out);
+     X(plan_scratch_free)(in);
+
+     if (sh) {
+	  char *a = structure_of(sh), *b = structure_of(ego->cld);
+	  int same = !strcmp(a, b);
+	  X(ifree)(a); X(ifree)(b);
+	  if (!same) {
+	       X(plan_destroy_internal)(sh);
+	       return 0;
+	  }
+	  X(plan_awake)(sh, wakefulness);
+     }
+     return sh;
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
 {
      P *ego = (P *) ego_;
      X(plan_awake)(ego->cld, wakefulness);
+
+     if (ego->shadow) {
+	  X(plan_awake)(ego->shadow, SLEEPY);
+	  X(plan_destroy_internal)(ego->shadow);
+	  ego->shadow = 0;
+     }
+     if (ego->n && (wakefulness == AWAKE_SQRTN_TABLE || wakefulness == AWAKE_SINCOS))
+	  ego->shadow = mkshadow(ego, wakefulness);
 }
 
 static void destroy(plan *ego_)
 {
      P *ego = (P *) ego_;
+     if (ego->shadow) X(plan_destroy_internal)(ego->shadow);
      X(plan_destroy_internal)(ego->cld);
 }
 
@@ -12247,6 +12391,32 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 
      if (p->sz->rnk != 1 || (p->sz->dims[0].n > 64))
 	  pln->super.super.pcost = pln->vl * cld->pcost;
+
+     pln->n = 0;
+     pln->shadow = 0;
+     if (1
+	 && p->sz->rnk == 1
+	 && p->vecsz->rnk == 1
+	 && d->is == 2 && d->os == 2
+	 && UNTAINT(p->ii) == UNTAINT(p->ri) + 1
+	 && UNTAINT(p->io) == UNTAINT(p->ro) + 1) {
+	  const iodim *t = p->sz->dims;
+	  INT nb = COLBUF_LINE / (2 * (INT)sizeof(R));
+	  int inplace = UNTAINT(p->ri) == UNTAINT(p->ro);
+	  if (1
+	      && t->is >= 2 * nb && t->os >= 2 * nb
+	      && (!inplace || t->is == t->os)
+	      && pln->vl >= nb
+	      && t->n * t->is * (INT)sizeof(R) >= FFTCHODE_COLBUF_MIN
+	      && t->n > l1_lines_at_stride(t->os * (INT)sizeof(R))) {
+	       pln->n = t->n;
+	       pln->is = t->is;
+	       pln->os = t->os;
+	       pln->nb = nb;
+	       pln->bd = X(bufdist)(t->n, nb);
+	       pln->inplace = inplace;
+	  }
+     }
 
      return &(pln->super.super);
 }
