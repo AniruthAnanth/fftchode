@@ -563,6 +563,28 @@ FFTW_DEFINE_API(FFTW_MANGLE_QUAD, __float128, fftwq_complex)
 
 #endif /* FFTW3_H */
 
+/* fftchode numerics switch: mode 0 = baseline (bit-identical to FFTW 3.3.10),
+   mode 1 = fast.  FFTCHODE_NUMERICS=baseline|fast is read once at first use. */
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+static std::atomic<int> fftchode_numerics_state(-1);
+extern "C" void fftchode_set_numerics(int mode)
+{
+     fftchode_numerics_state.store(mode == 1 ? 1 : 0);
+}
+extern "C" int fftchode_numerics_mode(void)
+{
+     int m = fftchode_numerics_state.load(std::memory_order_relaxed);
+     if (m < 0) {
+          const char *s = getenv("FFTCHODE_NUMERICS");
+          int expected = -1;
+          fftchode_numerics_state.compare_exchange_strong(expected, (s && !strcmp(s, "fast")) ? 1 : 0);
+          m = fftchode_numerics_state.load();
+     }
+     return m;
+}
+
 
 #define FFT_CPP_INNER 1
 #ifndef FFT_NO_DOUBLE
@@ -189085,6 +189107,54 @@ static plan *mkplan(planner *plnr, unsigned flags,
      return pln;
 }
 
+/* fftchode fast mode: a problem whose rough flop count is too small to gain
+   from threads is planned single-threaded.  Problems with a loop of
+   independent transforms (howmany > 1 or rank > 1) split cheaply over threads;
+   a single 1-d transform needs the threaded Cooley-Tukey split, which costs
+   extra passes and hand-offs, so it needs more work to pay off. */
+static double env_work(const char *name, double dflt)
+{
+     const char *s = getenv(name);
+     return (s && *s) ? atof(s) : dflt;
+}
+
+static int serial_plan_p(const problem *prb)
+{
+     static double min_vec = -1, min_1d = -1;
+     const tensor *sz, *vecsz;
+     double f, n, v;
+
+     switch (prb->adt->problem_kind) {
+	 case PROBLEM_DFT:
+	      sz = ((const problem_dft *) prb)->sz;
+	      vecsz = ((const problem_dft *) prb)->vecsz;
+	      f = 5;
+	      break;
+	 case PROBLEM_RDFT:
+	      sz = ((const problem_rdft *) prb)->sz;
+	      vecsz = ((const problem_rdft *) prb)->vecsz;
+	      f = 2.5;
+	      break;
+	 case PROBLEM_RDFT2:
+	      sz = ((const problem_rdft2 *) prb)->sz;
+	      vecsz = ((const problem_rdft2 *) prb)->vecsz;
+	      f = 2.5;
+	      break;
+	 default:
+	      return 0;
+     }
+     if (!FINITE_RNK(sz->rnk) || !FINITE_RNK(vecsz->rnk))
+	  return 0;
+     if (min_vec < 0) {
+	  min_1d = env_work("FFTCHODE_THREAD_SERIAL_WORK_1D", 524288);
+	  min_vec = env_work("FFTCHODE_THREAD_SERIAL_WORK", 131072);
+     }
+     n = (double) X(tensor_sz)(sz);
+     v = (double) X(tensor_sz)(vecsz);
+     f *= n * (n > 2 ? log2(n) : 1) * v;
+     return f < ((v > 1 || sz->rnk > 1) ? min_vec : min_1d);
+}
+
 extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
 {
      apiplan *p = 0;
@@ -189095,11 +189165,17 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
                                          FFTW_PATIENT, FFTW_EXHAUSTIVE};
      int pat, pat_max;
      double pcost = 0;
+     int nthr_save;
      
      if (before_planner_hook)
           before_planner_hook();
      
      plnr = X(the_planner)();
+
+     nthr_save = plnr->nthr;
+     if (nthr_save > 1 && fftchode_numerics_mode() == 1
+	 && serial_plan_p(prb))
+	  plnr->nthr = 1;
 
      if (flags & FFTW_WISDOM_ONLY) {
 	  /* Special mode that returns a plan only if wisdom is present,
@@ -189171,6 +189247,8 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
 #ifdef FFTW_RANDOM_ESTIMATOR
      X(random_estimate_seed)++; /* subsequent "random" plans are distinct */
 #endif
+
+     plnr->nthr = nthr_save;
 
      if (after_planner_hook)
           after_planner_hook();
@@ -194906,6 +194984,9 @@ typedef void *(*spawn_function) (spawn_data *);
 
 extern "C" void X(spawn_loop)(int loopmax, int nthreads,
 		   spawn_function proc, void *data);
+extern "C" void X(spawn_loop_work)(int loopmax, int nthreads,
+		   spawn_function proc, void *data, double work);
+extern "C" double X(spawn_work)(plan **plns, int n);
 extern "C" int X(ithreads_init)(void);
 extern "C" void X(threads_cleanup)(void);
 
@@ -195122,7 +195203,8 @@ static void apply_dit(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 	  d.r = ro; d.i = io;
 	  d.cldws = ego->cldws;
 
-	  X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*)&d);
+	  X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*)&d,
+				      X(spawn_work)(ego->cldws, ego->nthr));
      }
 }
 
@@ -195137,7 +195219,8 @@ static void apply_dif(const plan *ego_, R *ri, R *ii, R *ro, R *io)
 	  d.r = ri; d.i = ii;
 	  d.cldws = ego->cldws;
 
-	  X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*)&d);
+	  X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*)&d,
+				      X(spawn_work)(ego->cldws, ego->nthr));
      }
 
      cld = (plan_dft *) ego->cld;
@@ -195410,7 +195493,8 @@ static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
      d.cldrn = ego->cldrn;
      d.ri = ri; d.ii = ii; d.ro = ro; d.io = io;
 
-     X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*) &d);
+     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
@@ -196015,7 +196099,8 @@ static void apply_dit(const plan *ego_, R *I, R *O)
 	  d.IO = O;
 	  d.cldws = ego->cldws;
 
-	  X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*)&d);
+	  X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*)&d,
+				      X(spawn_work)(ego->cldws, ego->nthr));
      }
 }
 
@@ -196030,7 +196115,8 @@ static void apply_dif(const plan *ego_, R *I, R *O)
 	  d.IO = I;
 	  d.cldws = ego->cldws;
 
-	  X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*)&d);
+	  X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*)&d,
+				      X(spawn_work)(ego->cldws, ego->nthr));
      }
 
      cld = (plan_rdft *) ego->cld;
@@ -196265,7 +196351,8 @@ static void apply(const plan *ego_, R *I, R *O)
      d.cldrn = ego->cldrn;
      d.I = I; d.O = O;
 
-     X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*) &d);
+     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
@@ -196705,16 +196792,120 @@ static void os_static_mutex_unlock(os_static_mutex_t *s)
 /************************************************************************/
 
 /* Main code: */
+}}
+#include <atomic>
+#include <chrono>
+#include <new>
+#include <thread>
+#if defined(USING_POSIX_THREADS)
+#include <sched.h>
+#endif
+namespace FFT_PREC_NS {
+namespace f424_threads_threads {
+
+/* fftchode: workers spin briefly before sleeping on their semaphore, the
+   caller spins briefly before sleeping while it joins, and a loop whose
+   arithmetic work is too small to pay for a hand-off runs on fewer threads
+   (down to the calling thread alone).  Blocks are the same as upstream and
+   each block runs the same child plan, so the arithmetic, the plans and the
+   wisdom are unchanged; only which thread runs which block changes. */
+
+static inline void cpu_relax(void)
+{
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+     __builtin_ia32_pause();
+#elif defined(__GNUC__) && (defined(__aarch64__) || defined(__arm__))
+     __asm__ __volatile__("yield");
+#elif defined(_M_X64) || defined(_M_IX86)
+     _mm_pause();
+#endif
+}
+
+static inline void os_yield(void)
+{
+#if defined(USING_POSIX_THREADS)
+     sched_yield();
+#else
+     SwitchToThread();
+#endif
+}
+
+static long spin_idle_ns = 100000;   /* idle worker spin before sleeping */
+static long spin_join_ns = 1000000;  /* caller spin before sleeping in join */
+static double min_work = 16384;      /* flops a thread must get to be woken */
+static int max_lanes = 1;            /* CPUs this process may run on */
+/* threads that may run lanes besides the callers; nested loops share them,
+   so the process never runs more lanes at once than it has CPUs */
+static std::atomic<int> spare_lanes(0);
+
+static int take_lanes(int want)
+{
+     int a = spare_lanes.load(std::memory_order_relaxed);
+     for (;;) {
+	  int g = want < a ? want : a;
+	  if (g <= 0) return 0;
+	  if (spare_lanes.compare_exchange_weak(a, a - g, std::memory_order_acquire,
+						std::memory_order_relaxed))
+	       return g;
+     }
+}
+
+static int count_cpus(void)
+{
+     int n = 0;
+#if defined(__linux__)
+     cpu_set_t set;
+     if (sched_getaffinity(0, sizeof(set), &set) == 0)
+	  n = CPU_COUNT(&set);
+#endif
+     if (n <= 0)
+	  n = (int)std::thread::hardware_concurrency();
+     return n > 0 ? n : 1;
+}
+
+typedef std::chrono::steady_clock spin_clock;
+
+template <class F> static bool spin_until(F ready, long spin_ns)
+{
+     if (ready()) return true;
+     if (spin_ns <= 0) return false;
+     spin_clock::time_point t0 = spin_clock::now();
+     for (unsigned i = 1;; ++i) {
+	  cpu_relax();
+	  if (ready()) return true;
+	  if ((i & 127) == 0) {
+	       long el = (long)std::chrono::duration_cast<std::chrono::nanoseconds>(spin_clock::now() - t0).count();
+	       if (el > spin_ns) return false;
+	       if (el > 20000) os_yield();
+	  }
+     }
+}
+
+struct work {
+     spawn_function proc;
+     spawn_data *d;
+     int nd;
+};
+
 struct worker {
+     char pad0[64];
+     std::atomic<struct work *> pending;
+     std::atomic<int> sleeping;
+     std::atomic<int> finished;
+     std::atomic<int> waiting;
      os_sem_t ready;
      os_sem_t done;
-     struct work *w;
      struct worker *cdr;
+     char pad1[64];
 };
 
 static struct worker *make_worker(void)
 {
-     struct worker *q = (struct worker *)MALLOC(sizeof(*q), OTHER);
+     struct worker *q = new (MALLOC(sizeof(struct worker), OTHER)) worker;
+     q->pending.store((struct work *)0);
+     q->sleeping.store(0);
+     q->finished.store(0);
+     q->waiting.store(0);
      os_sem_init(&q->ready);
      os_sem_init(&q->done);
      return q;
@@ -196724,14 +196915,9 @@ static void unmake_worker(struct worker *q)
 {
      os_sem_destroy(&q->done);
      os_sem_destroy(&q->ready);
+     q->~worker();
      X(ifree)(q);
 }
-
-struct work {
-     spawn_function proc;
-     spawn_data d;
-     struct worker *q; /* the worker responsible for performing this work */
-};
 
 static os_mutex_t queue_lock;
 static os_sem_t termination_semaphore;
@@ -196744,25 +196930,64 @@ static struct worker *worker_queue;
      os_mutex_unlock(&queue_lock);		\
 }
 
+static void post_work(struct worker *q, struct work *w)
+{
+     q->finished.store(0, std::memory_order_relaxed);
+     q->pending.store(w, std::memory_order_seq_cst);
+     if (q->sleeping.load(std::memory_order_seq_cst))
+	  os_sem_up(&q->ready);
+}
+
+static struct work *take_work(struct worker *ego)
+{
+     struct work *w;
+     spin_until([ego] { return ego->pending.load(std::memory_order_acquire) != 0; },
+		spin_idle_ns);
+     for (;;) {
+	  w = ego->pending.exchange((struct work *)0, std::memory_order_acquire);
+	  if (w) return w;
+	  ego->sleeping.store(1, std::memory_order_seq_cst);
+	  w = ego->pending.exchange((struct work *)0, std::memory_order_seq_cst);
+	  if (w) {
+	       ego->sleeping.store(0, std::memory_order_relaxed);
+	       return w;
+	  }
+	  os_sem_down(&ego->ready);
+	  ego->sleeping.store(0, std::memory_order_relaxed);
+     }
+}
+
+static void join_worker(struct worker *q)
+{
+     if (spin_until([q] { return q->finished.load(std::memory_order_acquire) != 0; },
+		    spin_join_ns))
+	  return;
+     for (;;) {
+	  q->waiting.store(1, std::memory_order_seq_cst);
+	  if (q->finished.load(std::memory_order_seq_cst)) break;
+	  os_sem_down(&q->done);
+	  if (q->finished.load(std::memory_order_acquire)) break;
+     }
+     q->waiting.store(0, std::memory_order_relaxed);
+}
+
 static FFTW_WORKER worker(void *arg)
 {
      struct worker *ego = (struct worker *)arg;
-     struct work *w;
 
      for (;;) {
-	  /* wait until work becomes available */
-	  os_sem_down(&ego->ready);
-
-	  w = ego->w;
+	  struct work *w = take_work(ego);
+	  int i;
 
 	  /* !w->proc ==> terminate worker */
 	  if (!w->proc) break;
 
-	  /* do the work */
-          w->proc(&w->d);
+	  for (i = 0; i < w->nd; ++i)
+	       w->proc(&w->d[i]);
 
-	  /* signal that work is done */
-	  os_sem_up(&ego->done);
+	  ego->finished.store(1, std::memory_order_seq_cst);
+	  if (ego->waiting.load(std::memory_order_seq_cst))
+	       os_sem_up(&ego->done);
      }
 
      /* termination protocol */
@@ -196773,34 +196998,6 @@ static FFTW_WORKER worker(void *arg)
      return 0;
 }
 
-static void enqueue(struct worker *q)
-{
-     WITH_QUEUE_LOCK({
-	  q->cdr = worker_queue;
-	  worker_queue = q;
-     });
-}
-
-static struct worker *dequeue(void)
-{
-     struct worker *q;
-
-     WITH_QUEUE_LOCK({
-	  q = worker_queue;
-	  if (q)
-	       worker_queue = q->cdr;
-     });
-
-     if (!q) {
-	  /* no worker is available.  Create one */
-	  q = make_worker();
-	  os_create_thread(worker, q);
-     }
-
-     return q;
-}
-
-
 static void kill_workforce(void)
 {
      struct work w;
@@ -196808,17 +197005,11 @@ static void kill_workforce(void)
      w.proc = 0;
 
      WITH_QUEUE_LOCK({
-	  /* tell all workers that they must terminate.
-
-	     Because workers enqueue themselves before signaling the
-	     completion of the work, all workers belong to the worker queue
-	     if we get here.  Also, all workers are waiting at
-	     os_sem_down(ready), so we can hold the queue lock without
-	     deadlocking */
+	  /* all workers are idle and in the queue when we get here */
 	  while (worker_queue) {
 	       struct worker *q = worker_queue;
 	       worker_queue = q->cdr;
-	       q->w = &w;
+	       q->pending.store(&w, std::memory_order_seq_cst);
 	       os_sem_up(&q->ready);
 	       os_sem_down(&termination_semaphore);
 	       unmake_worker(q);
@@ -196828,9 +197019,23 @@ static void kill_workforce(void)
 
 static os_static_mutex_t initialization_mutex = OS_STATIC_MUTEX_INITIALIZER;
 
+static void read_env_long(const char *name, long *v)
+{
+     const char *s = getenv(name);
+     if (s && *s) *v = atol(s);
+}
+
 extern "C" int X(ithreads_init)(void)
 {
      os_static_mutex_lock(&initialization_mutex); {
+	  long mw = (long)min_work;
+	  read_env_long("FFTCHODE_SPIN_IDLE_NS", &spin_idle_ns);
+	  read_env_long("FFTCHODE_SPIN_JOIN_NS", &spin_join_ns);
+	  read_env_long("FFTCHODE_THREAD_MIN_WORK", &mw);
+	  min_work = (double)mw;
+	  max_lanes = count_cpus();
+	  spare_lanes.store(max_lanes - 1);
+
           os_mutex_init(&queue_lock);
           os_sem_init(&termination_semaphore);
 
@@ -196842,17 +197047,31 @@ extern "C" int X(ithreads_init)(void)
      return 0; /* no error */
 }
 
+extern "C" double X(spawn_work)(plan **plns, int n)
+{
+     double w = 0;
+     int i;
+     for (i = 0; i < n; ++i)
+	  w += plns[i]->ops.add + plns[i]->ops.mul
+	       + 2 * plns[i]->ops.fma + plns[i]->ops.other;
+     return w;
+}
+
 /* Distribute a loop from 0 to loopmax-1 over nthreads threads.
    proc(d) is called to execute a block of iterations from d->min
-   to d->max-1.  d->thr_num indicate the number of the thread
-   that is executing proc (from 0 to nthreads-1), and d->data is
-   the same as the data parameter passed to X(spawn_loop).
+   to d->max-1.  d->thr_num indicate the number of the block
+   (from 0 to nthreads-1), and d->data is the same as the data
+   parameter passed to X(spawn_loop).  work is the number of flops of
+   the whole loop; blocks are grouped onto fewer threads when a thread
+   would get less than min_work of them.
 
-   This function returns only after all the threads have completed. */
-extern "C" void X(spawn_loop)(int loopmax, int nthr, spawn_function proc, void *data)
+   This function returns only after all the blocks have completed. */
+extern "C" void X(spawn_loop_work)(int loopmax, int nthr, spawn_function proc, void *data,
+				   double work)
 {
-     int block_size;
+     int block_size, nlanes;
      int i;
+     spawn_data *sdata;
 
      A(loopmax >= 0);
      A(nthr > 0);
@@ -196868,57 +197087,88 @@ extern "C" void X(spawn_loop)(int loopmax, int nthr, spawn_function proc, void *
      block_size = (loopmax + nthr - 1) / nthr;
      nthr = (loopmax + block_size - 1) / block_size;
 
+     STACK_MALLOC(spawn_data *, sdata, sizeof(spawn_data) * nthr);
+     for (i = 0; i < nthr; ++i) {
+	  spawn_data *d = &sdata[i];
+	  d->max = (d->min = i * block_size) + block_size;
+	  if (d->max > loopmax)
+	       d->max = loopmax;
+	  d->thr_num = i;
+	  d->data = data;
+     }
+
      if (X(spawnloop_callback)) { /* user-defined spawnloop backend */
-          spawn_data *sdata;
-          STACK_MALLOC(spawn_data *, sdata, sizeof(spawn_data) * nthr);
-          for (i = 0; i < nthr; ++i) {
-               spawn_data *d = &sdata[i];
-               d->max = (d->min = i * block_size) + block_size;
-               if (d->max > loopmax)
-                    d->max = loopmax;
-               d->thr_num = i;
-               d->data = data;
-          }
           X(spawnloop_callback)(proc, sdata, sizeof(spawn_data), nthr, X(spawnloop_callback_data));
-          STACK_FREE(sdata);
+	  STACK_FREE(sdata);
+	  return;
      }
-     else {
-          struct work *r;
-          STACK_MALLOC(struct work *, r, sizeof(struct work) * nthr);
 
-          /* distribute work: */
-          for (i = 0; i < nthr; ++i) {
-               struct work *w = &r[i];
-               spawn_data *d = &w->d;
+     nlanes = nthr;
+     if (work < min_work * nthr)
+	  nlanes = work < 2 * min_work ? 1 : (int)(work / min_work);
+     nlanes = 1 + (nlanes > 1 ? take_lanes(nlanes - 1) : 0);
 
-               d->max = (d->min = i * block_size) + block_size;
-               if (d->max > loopmax)
-                    d->max = loopmax;
-               d->thr_num = i;
-               d->data = data;
-               w->proc = proc;
+     if (nlanes <= 1) {
+	  for (i = 0; i < nthr; ++i)
+	       proc(&sdata[i]);
+     } else {
+	  struct work *r;
+	  struct worker **qs;
+	  int j;
 
-               if (i == nthr - 1) {
-                    /* do the work ourselves */
-                    proc(d);
-               } else {
-                    /* assign a worker to W */
-                    w->q = dequeue();
+	  STACK_MALLOC(struct work *, r, sizeof(struct work) * nlanes);
+	  STACK_MALLOC(struct worker **, qs, sizeof(struct worker *) * nlanes);
 
-                    /* tell worker w->q to do it */
-                    w->q->w = w; /* Dirac could have written this */
-                    os_sem_up(&w->q->ready);
-               }
-          }
+	  for (j = 0; j < nlanes; ++j) {
+	       int lo = (int)(((long long)j * nthr) / nlanes);
+	       int hi = (int)(((long long)(j + 1) * nthr) / nlanes);
+	       r[j].proc = proc;
+	       r[j].d = sdata + lo;
+	       r[j].nd = hi - lo;
+	  }
 
-          for (i = 0; i < nthr - 1; ++i) {
-               struct work *w = &r[i];
-               os_sem_down(&w->q->done);
-               enqueue(w->q);
-          }
+	  WITH_QUEUE_LOCK({
+	       for (j = 0; j < nlanes - 1; ++j) {
+		    qs[j] = worker_queue;
+		    if (qs[j])
+			 worker_queue = qs[j]->cdr;
+	       }
+	  });
+	  for (j = 0; j < nlanes - 1; ++j) {
+	       if (!qs[j]) {
+		    /* no worker is available.  Create one */
+		    qs[j] = make_worker();
+		    os_create_thread(worker, qs[j]);
+	       }
+	       post_work(qs[j], &r[j]);
+	  }
 
-          STACK_FREE(r);
+	  /* do the last lane ourselves */
+	  for (i = 0; i < r[nlanes - 1].nd; ++i)
+	       proc(&r[nlanes - 1].d[i]);
+
+	  for (j = 0; j < nlanes - 1; ++j)
+	       join_worker(qs[j]);
+
+	  /* push back in reverse so that the next loop hands lane j to the
+	     same worker (and its warm cache) again */
+	  WITH_QUEUE_LOCK({
+	       for (j = nlanes - 2; j >= 0; --j) {
+		    qs[j]->cdr = worker_queue;
+		    worker_queue = qs[j];
+	       }
+	  });
+	  spare_lanes.fetch_add(nlanes - 1, std::memory_order_release);
+
+	  STACK_FREE(qs);
+	  STACK_FREE(r);
      }
+     STACK_FREE(sdata);
+}
+
+extern "C" void X(spawn_loop)(int loopmax, int nthr, spawn_function proc, void *data)
+{
+     X(spawn_loop_work)(loopmax, nthr, proc, data, HUGE_VAL);
 }
 
 extern "C" void X(threads_cleanup)(void)
@@ -197038,7 +197288,8 @@ static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
      d.cldrn = ego->cldrn;
      d.r0 = r0; d.r1 = r1; d.cr = cr; d.ci = ci;
 
-     X(spawn_loop)(ego->nthr, ego->nthr, spawn_apply, (void*) &d);
+     X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
 static void awake(plan *ego_, enum wakefulness wakefulness)
