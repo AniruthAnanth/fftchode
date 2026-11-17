@@ -5169,7 +5169,7 @@ extern "C" plan *X(mkplan_shadow)(planner *plnr, problem *prb, const plan *like,
 	  char *a = structure_of(sh), *b = structure_of(like);
 	  int same = !strcmp(a, b);
 	  X(ifree)(a); X(ifree)(b);
-	  if (!same) {
+	  if (!same && !::fftchode_numerics_mode()) {
 	       X(plan_destroy_internal)(sh);
 	       return 0;
 	  }
@@ -12937,6 +12937,35 @@ static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
 	       pln->nb = nb;
 	       pln->bd = X(bufdist)(t->n, nb);
 	       pln->inplace = inplace;
+	  }
+     }
+     if (pln->n && ::fftchode_numerics_mode() && X(shadow_ok)(plnr)) {
+	  flags_t flags = plnr->flags;
+	  int nthr = plnr->nthr;
+	  plan *sh;
+	  plnr->flags.hash_info = 0;
+	  plnr->nthr = 1;
+	  sh = X(mkplan_d)(plnr,
+			  X(mkproblem_dft_d)(
+			       X(mktensor_1d)(pln->n, pln->inplace ? 2 : pln->is, 2),
+			       X(mktensor_0d)(),
+			       p->ri, p->ii, pln->inplace ? p->ri : p->ro,
+			       pln->inplace ? p->ii : p->io));
+	  plnr->flags = flags;
+	  plnr->nthr = nthr;
+	  if (sh) {
+	       INT nblk = pln->vl / pln->nb, rest = pln->vl - nblk * pln->nb;
+	       opcnt *o = &pln->super.super.ops;
+	       X(ops_zero)(o);
+	       o->other = 3.14159;
+	       X(ops_madd2)(nblk * pln->nb, &sh->ops, o);
+	       X(ops_madd2)(rest, &cld->ops, o);
+	       o->other += (pln->inplace ? 4.0 : 2.0) * (double)pln->n * (double)(nblk * pln->nb);
+	       X(fc_mem)(o, 1, pln->nb, pln->ovs, pln->n, pln->os, 2 * sizeof(R), nblk, pln->nb * pln->ovs);
+	       if (pln->inplace)
+		    X(fc_mem)(o, 1, pln->nb, pln->ivs, pln->n, pln->is, 2 * sizeof(R), nblk, pln->nb * pln->ivs);
+	       o->fcl[4] += (double)pln->vl;
+	       X(plan_destroy_internal)(sh);
 	  }
      }
 

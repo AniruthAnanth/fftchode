@@ -560,6 +560,61 @@ rep('''\t  pln->super.super.could_prune_now_p |= cldws[i]->could_prune_now_p;
      X(ops_add2)(&cld->ops, &pln->super.super.ops);
 ''' % FAST, 2)
 
+# ---------------------------------------------------------------- fftchode column buffering, if present
+# The shadow (the child replanned for the buffered columns) must have the
+# child's structure only so that baseline mode stays bit-identical.  The fast
+# cost model plans the buffered problem differently from the strided one, so
+# the identical-structure check rejected nearly every shadow in fast mode and
+# column passes ran unbuffered.
+if 'extern "C" plan *X(mkplan_shadow)' in s:
+    rep('''\t  int same = !strcmp(a, b);
+\t  X(ifree)(a); X(ifree)(b);
+\t  if (!same) {''', '''\t  int same = !strcmp(a, b);
+\t  X(ifree)(a); X(ifree)(b);
+\t  if (!same && !%s) {''' % FAST)
+    # price a buffered column loop as what it runs: the shadow plan on nb
+    # adjacent columns at a time plus the copy of their lines back
+    rep('''\t       pln->bd = X(bufdist)(t->n, nb);
+\t       pln->inplace = inplace;
+\t  }
+     }
+
+     return &(pln->super.super);''', '''\t       pln->bd = X(bufdist)(t->n, nb);
+\t       pln->inplace = inplace;
+\t  }
+     }
+     if (pln->n && %s && X(shadow_ok)(plnr)) {
+\t  flags_t flags = plnr->flags;
+\t  int nthr = plnr->nthr;
+\t  plan *sh;
+\t  plnr->flags.hash_info = 0;
+\t  plnr->nthr = 1;
+\t  sh = X(mkplan_d)(plnr,
+\t\t\t  X(mkproblem_dft_d)(
+\t\t\t       X(mktensor_1d)(pln->n, pln->inplace ? 2 : pln->is, 2),
+\t\t\t       X(mktensor_0d)(),
+\t\t\t       p->ri, p->ii, pln->inplace ? p->ri : p->ro,
+\t\t\t       pln->inplace ? p->ii : p->io));
+\t  plnr->flags = flags;
+\t  plnr->nthr = nthr;
+\t  if (sh) {
+\t       INT nblk = pln->vl / pln->nb, rest = pln->vl - nblk * pln->nb;
+\t       opcnt *o = &pln->super.super.ops;
+\t       X(ops_zero)(o);
+\t       o->other = 3.14159;
+\t       X(ops_madd2)(nblk * pln->nb, &sh->ops, o);
+\t       X(ops_madd2)(rest, &cld->ops, o);
+\t       o->other += (pln->inplace ? 4.0 : 2.0) * (double)pln->n * (double)(nblk * pln->nb);
+\t       X(fc_mem)(o, 1, pln->nb, pln->ovs, pln->n, pln->os, 2 * sizeof(R), nblk, pln->nb * pln->ovs);
+\t       if (pln->inplace)
+\t\t    X(fc_mem)(o, 1, pln->nb, pln->ivs, pln->n, pln->is, 2 * sizeof(R), nblk, pln->nb * pln->ivs);
+\t       o->fcl[4] += (double)pln->vl;
+\t       X(plan_destroy_internal)(sh);
+\t  }
+     }
+
+     return &(pln->super.super);''' % FAST)
+
 # ---------------------------------------------------------------- lanes of a parallel region
 if 'static int max_lanes = 1;' in s:
     rep('''extern "C" double X(spawn_work)(plan **plns, int n)
