@@ -3,6 +3,7 @@
 // Links against any FFTW3-API object: this repo's fft.o (any revision) or upstream libfftw3[f].
 //
 //   fftsuite --suite FILE --threads N [--mode time|mem|hash|err] [--batches K] [--tmin S] [--only NAME]
+//            [--plan estimate|measure|patient]   (default estimate; MATLAB's mode)
 //
 // Case line:  name prec kind shape howmany layout place
 //   prec  d|s        kind  cf (c2c fwd) cb (c2c bwd) rf (r2c) rb (c2r)
@@ -28,6 +29,7 @@
 #include <pmmintrin.h>
 #endif
 
+static unsigned g_flags = FFTW_ESTIMATE;
 extern "C" { int mt_enabled(void); long mt_live(void); long mt_peak(void); void mt_reset_peak(void); }
 
 static double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
@@ -52,11 +54,11 @@ template <> struct Api<T> {                                                     
     static void *alloc(size_t n) { return P##malloc(n); }                                            \
     static void release(void *p) { P##free(p); }                                                     \
     static plan dft(int r, const dim *d, int hr, const dim *hd, T *in, T *out, int sign) {           \
-        return P##plan_guru64_dft(r, d, hr, hd, (P##complex *)in, (P##complex *)out, sign, FFTW_ESTIMATE); } \
+        return P##plan_guru64_dft(r, d, hr, hd, (P##complex *)in, (P##complex *)out, sign, g_flags); } \
     static plan r2c(int r, const dim *d, int hr, const dim *hd, T *in, T *out) {                     \
-        return P##plan_guru64_dft_r2c(r, d, hr, hd, in, (P##complex *)out, FFTW_ESTIMATE); }          \
+        return P##plan_guru64_dft_r2c(r, d, hr, hd, in, (P##complex *)out, g_flags); }          \
     static plan c2r(int r, const dim *d, int hr, const dim *hd, T *in, T *out) {                     \
-        return P##plan_guru64_dft_c2r(r, d, hr, hd, (P##complex *)in, out, FFTW_ESTIMATE); }          \
+        return P##plan_guru64_dft_c2r(r, d, hr, hd, (P##complex *)in, out, g_flags); }          \
     static void exec(plan p) { P##execute(p); }                                                      \
     static void destroy(plan p) { P##destroy_plan(p); }                                              \
     static void threads(int n) { P##plan_with_nthreads(n); }                                         \
@@ -135,8 +137,8 @@ template <typename T> static bool make(const Case &c, Prob<T> &P, bool fill_inpu
             fftw_iodim64 dd[8]; for (int k = 0; k < P.g.rank; k++) dd[k] = {P.g.d[k].n, P.g.d[k].os, P.g.d[k].is};
             fftw_iodim64 vv = {P.g.v.n, P.g.v.os, P.g.v.is};
             T *rin = (T *)Api<T>::alloc(sizeof(T) * P.g.out_len);
-            memcpy(rin, tmpin.data(), sizeof(T) * P.g.out_len);
             auto q = Api<T>::r2c(P.g.rank, (const D *)dd, hr, (const D *)&vv, rin, P.in);
+            memcpy(rin, tmpin.data(), sizeof(T) * P.g.out_len);
             Api<T>::exec(q); Api<T>::destroy(q); Api<T>::release(rin);
         } else fill(P.in, ilen, c);
         P.backup.assign(P.in, P.in + ilen);
@@ -218,6 +220,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--batches")) g_batches = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tmin")) g_tmin = atof(argv[++i]);
         else if (!strcmp(argv[i], "--only")) only = argv[++i];
+        else if (!strcmp(argv[i], "--plan")) { const char *m = argv[++i];
+            g_flags = !strcmp(m, "measure") ? FFTW_MEASURE : !strcmp(m, "patient") ? FFTW_PATIENT : FFTW_ESTIMATE; }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     if (!suite) { fprintf(stderr, "usage: fftsuite --suite FILE [--threads N] [--mode time|mem|hash|err]\n"); return 2; }
