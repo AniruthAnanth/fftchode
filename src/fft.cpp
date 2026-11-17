@@ -195494,6 +195494,9 @@ static void apply(const plan *ego_, R *ri, R *ii, R *ro, R *io)
      d.ri = ri; d.ii = ii; d.ro = ro; d.io = io;
 
      X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   /* blocks whose outputs start less than a cache line apart share
+			      lines (false sharing): run them on the caller */
+			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
 			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
@@ -196352,6 +196355,9 @@ static void apply(const plan *ego_, R *I, R *O)
      d.I = I; d.O = O;
 
      X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   /* blocks whose outputs start less than a cache line apart share
+			      lines (false sharing): run them on the caller */
+			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
 			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
@@ -197289,6 +197295,9 @@ static void apply(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
      d.r0 = r0; d.r1 = r1; d.cr = cr; d.ci = ci;
 
      X(spawn_loop_work)(ego->nthr, ego->nthr, spawn_apply, (void*) &d,
+			   /* blocks whose outputs start less than a cache line apart share
+			      lines (false sharing): run them on the caller */
+			   X(iabs)(ego->ots) * (INT)sizeof(R) < 64 ? 0 :
 			   X(spawn_work)(ego->cldrn, ego->nthr));
 }
 
