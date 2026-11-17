@@ -198290,6 +198290,7 @@ namespace f431_simd_support_neon {
 #undef F77_FUNC
 #undef F77_FUNC_
 #undef F77x
+#undef FFTCHODE_PAIR_BUF_BYTES
 #undef FFTW_2R_IS_DOUBLE
 #undef FFTW_CC
 #undef FFTW_DLL
@@ -298284,6 +298285,8 @@ extern "C" void XSIMD(codelet_hc2cbdftv_32)(planner *);
 extern "C" void XSIMD(codelet_hc2cbdftv_20)(planner *);
 
 
+extern "C" void XSIMD(fftchode_rdft2_pair_register)(planner *);
+
 extern "C" const solvtab XSIMD(solvtab_rdft);
 extern "C" const solvtab XSIMD(solvtab_rdft) = {
    SOLVTAB(XSIMD(codelet_hc2cfdftv_2)),
@@ -298304,6 +298307,7 @@ extern "C" const solvtab XSIMD(solvtab_rdft) = {
    SOLVTAB(XSIMD(codelet_hc2cbdftv_16)),
    SOLVTAB(XSIMD(codelet_hc2cbdftv_32)),
    SOLVTAB(XSIMD(codelet_hc2cbdftv_20)),
+   SOLVTAB(XSIMD(fftchode_rdft2_pair_register)),
    SOLVTAB_END
 };
 }
@@ -305851,6 +305855,324 @@ extern "C" void XSIMD(codelet_hc2cfdftv_8) (planner *p) {
 #undef LDW
 #undef TWVL
 #undef VTW
+#pragma pop_macro("LD")
+#pragma pop_macro("ST")
+
+/* ==== fftchode/rdft2-pair.c ==== */
+#pragma push_macro("LD")
+#pragma push_macro("ST")
+namespace f624_fftchode_rdft2_pair {
+/*
+ * fftchode (FFTE-6, opt/simd): real-data transforms of adjacent columns
+ * (real-side vector stride 1, as MATLAB fft(x,[],2) of a real matrix) by
+ * one complex SIMD DFT per pair of columns ("two real DFTs for one complex").
+ *
+ *   R2HC: z = x_2p + i x_2p+1, Z = DFT(z),
+ *         X_2p[f] = (Z[f] + conj Z[n-f]) / 2, X_2p+1[f] = i (conj Z[n-f] - Z[f]) / 2
+ *   HC2R: Z[f] = X_2p[f] + i X_2p+1[f] (Hermitian extension), z = IDFT(Z),
+ *         x_2p = Re z, x_2p+1 = Im z
+ *
+ * Pairs are packed into a buffer, one contiguous complex transform per pair, in
+ * blocks of b2 pairs (b2 a multiple of VL); the block transforms (buffer to a
+ * second buffer) are planned by FFTW's planner as ordinary contiguous vector DFTs.  Pack/unpack loops use the
+ * FFTW SIMD macros, so this file is compiled once per SIMD extension and is
+ * registered only with that extension's codelets (i.e. only in fast mode).
+ * Columns left over (fewer than 2*VL) go to an ordinary rdft2 child plan.
+ */
+
+
+#define FFTCHODE_PAIR_BUF_BYTES 262144
+
+typedef struct {
+     solver super;
+} S;
+
+typedef struct {
+     plan_rdft2 super;
+     plan *cld, *cldlast, *cldrest;
+     INT n, b2, nblk, last, rs, cs, cv, ncols;
+     int simd;
+} P;
+
+/* real side: SIMD when every row of pairs is complex-aligned, else scalar (odd row count) */
+static void pack_r2hc(const R *x, R *B, INT n, INT rs, INT nb, int simd)
+{
+     INT f, p;
+     for (f = 0; f < n; ++f) {
+	  const R *xf = x + f * rs;
+	  if (simd)
+	       for (p = 0; p < nb; p += VL)
+		    ST(B + 2 * (p * n + f), LD(xf + 2 * p, 2, xf + 2 * p), 2 * n, B + 2 * f);
+	  else
+	       for (p = 0; p < nb; ++p) {
+		    B[2 * (p * n + f)] = xf[2 * p];
+		    B[2 * (p * n + f) + 1] = xf[2 * p + 1];
+	       }
+     }
+}
+
+static void post_r2hc(const R *B, R *cr, INT n, INT cs, INT cv, INT nb)
+{
+     DVK(KP500000000, +0.500000000000000000000000000000000000000000000);
+     INT f, p;
+     for (p = 0; p < nb; p += VL) {
+	  const R *b = B + 2 * p * n;
+	  R *o = cr + 2 * p * cv;
+	  for (f = 0; f + f <= n; ++f) {
+	       INT g = f ? n - f : 0;
+	       V z = LD(b + 2 * f, 2 * n, b + 2 * f);
+	       V zc = VCONJ(LD(b + 2 * g, 2 * n, b + 2 * g));
+	       ST(o + f * cs, VMUL(LDK(KP500000000), VADD(z, zc)), 2 * cv, o + f * cs);
+	       ST(o + f * cs + cv, VMUL(LDK(KP500000000), VBYI(VSUB(zc, z))), 2 * cv, o + f * cs + cv);
+	  }
+     }
+}
+
+static void pre_hc2r(const R *cr, R *B, INT n, INT cs, INT cv, INT nb)
+{
+     DVK(KP500000000, +0.500000000000000000000000000000000000000000000);
+     INT f, p;
+     for (p = 0; p < nb; p += VL) {
+	  const R *i = cr + 2 * p * cv;
+	  R *b = B + 2 * p * n;
+	  for (f = 0; f + f <= n; ++f) {
+	       V a = LD(i + f * cs, 2 * cv, i + f * cs);
+	       V c = LD(i + f * cs + cv, 2 * cv, i + f * cs + cv);
+	       if (f == 0 || f + f == n) {
+		    /* FFTW ignores the imaginary parts of DC and Nyquist */
+		    a = VMUL(LDK(KP500000000), VADD(a, VCONJ(a)));
+		    c = VMUL(LDK(KP500000000), VADD(c, VCONJ(c)));
+		    ST(b + 2 * f, VADD(a, VBYI(c)), 2 * n, b + 2 * f);
+	       } else {
+		    ST(b + 2 * f, VADD(a, VBYI(c)), 2 * n, b + 2 * f);
+		    ST(b + 2 * (n - f), VADD(VCONJ(a), VBYI(VCONJ(c))), 2 * n, b + 2 * (n - f));
+	       }
+	  }
+     }
+}
+
+static void unpack_hc2r(const R *B, R *x, INT n, INT rs, INT nb, int simd)
+{
+     INT f, p;
+     for (f = 0; f < n; ++f) {
+	  R *xf = x + f * rs;
+	  if (simd)
+	       for (p = 0; p < nb; p += VL)
+		    ST(xf + 2 * p, LD(B + 2 * (p * n + f), 2 * n, B + 2 * f), 2, xf + 2 * p);
+	  else
+	       for (p = 0; p < nb; ++p) {
+		    xf[2 * p] = B[2 * (p * n + f)];
+		    xf[2 * p + 1] = B[2 * (p * n + f) + 1];
+	       }
+     }
+}
+
+static void apply_r2hc(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
+{
+     const P *ego = (const P *) ego_;
+     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, cs = ego->cs, cv = ego->cv;
+     R *B = (R *) MALLOC(sizeof(R) * 4 * n * b2, BUFFERS), *C = B + 2 * n * b2;
+     plan_dft *cld = (plan_dft *) ego->cld;
+     plan_rdft2 *cldrest;
+     UNUSED(r1); UNUSED(ci);
+
+     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2, cr += 2 * b2 * cv) {
+	  pack_r2hc(r0, B, n, rs, b2, ego->simd);
+	  cld->apply((plan *) cld, B, B + 1, C, C + 1);
+	  post_r2hc(C, cr, n, cs, cv, b2);
+     }
+     if (ego->last) {
+	  cld = (plan_dft *) ego->cldlast;
+	  pack_r2hc(r0, B, n, rs, ego->last, ego->simd);
+	  cld->apply((plan *) cld, B, B + 1, C, C + 1);
+	  post_r2hc(C, cr, n, cs, cv, ego->last);
+	  r0 += 2 * ego->last; cr += 2 * ego->last * cv;
+     }
+     VLEAVE();
+     X(ifree)(B);
+
+     cldrest = (plan_rdft2 *) ego->cldrest;
+     cldrest->apply((plan *) cldrest, r0, r0 + rs, cr, cr + 1);
+}
+
+static void apply_hc2r(const plan *ego_, R *r0, R *r1, R *cr, R *ci)
+{
+     const P *ego = (const P *) ego_;
+     INT k, n = ego->n, b2 = ego->b2, rs = ego->rs, cs = ego->cs, cv = ego->cv;
+     R *B = (R *) MALLOC(sizeof(R) * 4 * n * b2, BUFFERS), *C = B + 2 * n * b2;
+     plan_dft *cld = (plan_dft *) ego->cld;
+     plan_rdft2 *cldrest;
+     UNUSED(r1); UNUSED(ci);
+
+     for (k = 0; k < ego->nblk; ++k, r0 += 2 * b2, cr += 2 * b2 * cv) {
+	  pre_hc2r(cr, B, n, cs, cv, b2);
+	  cld->apply((plan *) cld, B + 1, B, C + 1, C);
+	  unpack_hc2r(C, r0, n, rs, b2, ego->simd);
+     }
+     if (ego->last) {
+	  cld = (plan_dft *) ego->cldlast;
+	  pre_hc2r(cr, B, n, cs, cv, ego->last);
+	  cld->apply((plan *) cld, B + 1, B, C + 1, C);
+	  unpack_hc2r(C, r0, n, rs, ego->last, ego->simd);
+	  r0 += 2 * ego->last; cr += 2 * ego->last * cv;
+     }
+     VLEAVE();
+     X(ifree)(B);
+
+     cldrest = (plan_rdft2 *) ego->cldrest;
+     cldrest->apply((plan *) cldrest, r0, r0 + rs, cr, cr + 1);
+}
+
+static void awake(plan *ego_, enum wakefulness wakefulness)
+{
+     P *ego = (P *) ego_;
+     X(plan_awake)(ego->cld, wakefulness);
+     X(plan_awake)(ego->cldlast, wakefulness);
+     X(plan_awake)(ego->cldrest, wakefulness);
+}
+
+static void destroy(plan *ego_)
+{
+     P *ego = (P *) ego_;
+     X(plan_destroy_internal)(ego->cldrest);
+     X(plan_destroy_internal)(ego->cldlast);
+     X(plan_destroy_internal)(ego->cld);
+}
+
+static void print(const plan *ego_, printer *p)
+{
+     const P *ego = (const P *) ego_;
+     p->print(p, "(%s-%s%s-%D-x%D/%D%(%p%)%(%p%)%(%p%))",
+	      XSIMD_STRING("rdft2-pair"),
+	      ego->super.apply == apply_r2hc ? "r2hc" : "hc2r", ego->simd ? "" : "-scalarpack",
+	      ego->n, ego->ncols, ego->b2,
+	      ego->cld, ego->cldlast, ego->cldrest);
+}
+
+static int applicable(const problem_rdft2 *p, const planner *plnr,
+		      INT *rs, INT *cs, INT *cv, INT *vl)
+{
+     INT rs2, rv;
+     if (!(1
+	   && !NO_SIMDP(plnr)
+	   && !NO_BUFFERINGP(plnr)
+	   && (p->kind == R2HC || p->kind == HC2R)
+	   && p->sz->rnk == 1
+	   && p->vecsz->rnk == 1
+	   && p->sz->dims[0].n >= 2
+	   && p->r0 != p->cr
+	   && p->ci == p->cr + 1))
+	  return 0;
+     X(rdft2_strides)(p->kind, p->sz->dims, &rs2, cs);
+     X(rdft2_strides)(p->kind, p->vecsz->dims, &rv, cv);
+     *rs = rs2 / 2;
+     *vl = p->vecsz->dims[0].n;
+     return (1
+	     && rv == 1
+	     && rs2 == 2 * (p->r1 - p->r0)
+	     && *vl >= 2 * VL
+	     && ALIGNED(p->cr)
+	     && SIMD_STRIDE_OK(*cs)
+	     && SIMD_STRIDE_OK(*cv));
+}
+
+static plan *mkcld(planner *plnr, INT n, INT nb, R *B, R *C, rdft_kind kind)
+{
+     /* the backward (HC2R) transform is the forward one with re/im swapped */
+     int s = (kind == HC2R);
+     return X(mkplan_d)(plnr,
+			X(mkproblem_dft_d)(X(mktensor_1d)(n, 2, 2),
+					   X(mktensor_1d)(nb, 2 * n, 2 * n),
+					   B + s, B + 1 - s, C + s, C + 1 - s));
+}
+
+static plan *mkplan(const solver *ego_, const problem *p_, planner *plnr)
+{
+     const problem_rdft2 *p = (const problem_rdft2 *) p_;
+     P *pln;
+     plan *cld = 0, *cldlast = 0, *cldrest = 0;
+     R *B = 0;
+     INT n, rs, cs, cv, vl, npairs, b2, nblk, last, ncols;
+     static const plan_adt padt = {
+	  X(rdft2_solve), awake, print, destroy
+     };
+     UNUSED(ego_);
+
+     if (!applicable(p, plnr, &rs, &cs, &cv, &vl))
+	  return (plan *) 0;
+
+     n = p->sz->dims[0].n;
+     npairs = (vl / (2 * VL)) * VL;
+     ncols = 2 * npairs;
+     b2 = (FFTCHODE_PAIR_BUF_BYTES / (INT)(2 * sizeof(R) * n)) / VL * VL;
+     if (b2 < VL) b2 = VL;
+     if (b2 > npairs) b2 = npairs;
+     nblk = npairs / b2;
+     last = npairs - nblk * b2;
+
+     B = (R *) MALLOC(sizeof(R) * 4 * n * b2, BUFFERS);
+     cld = mkcld(plnr, n, b2, B, B + 2 * n * b2, p->kind);
+     if (!cld) goto nada;
+     if (last) {
+	  cldlast = mkcld(plnr, n, last, B, B + 2 * n * b2, p->kind);
+	  if (!cldlast) goto nada;
+     }
+     X(ifree)(B); B = 0;
+
+     cldrest = X(mkplan_d)(plnr,
+			   X(mkproblem_rdft2_d)(X(tensor_copy)(p->sz),
+						X(mktensor_1d)(vl - ncols, p->vecsz->dims[0].is, p->vecsz->dims[0].os),
+						p->r0 + ncols, p->r1 + ncols,
+						p->cr + ncols * cv, p->ci + ncols * cv,
+						p->kind));
+     if (!cldrest) goto nada;
+
+     pln = MKPLAN_RDFT2(P, &padt, p->kind == R2HC ? apply_r2hc : apply_hc2r);
+     pln->cld = cld;
+     pln->cldlast = cldlast;
+     pln->cldrest = cldrest;
+     pln->n = n;
+     pln->b2 = b2;
+     pln->nblk = nblk;
+     pln->last = last;
+     pln->rs = rs;
+     pln->cs = cs;
+     pln->cv = cv;
+     pln->ncols = ncols;
+     pln->simd = ALIGNED(p->r0) && SIMD_STRIDE_OK(rs);
+
+     X(ops_zero)(&pln->super.super.ops);
+     X(ops_madd2)(nblk, &cld->ops, &pln->super.super.ops);
+     if (cldlast)
+	  X(ops_add2)(&cldlast->ops, &pln->super.super.ops);
+     X(ops_add2)(&cldrest->ops, &pln->super.super.ops);
+     /* per VL pairs: pack or unpack (n loads + n stores) and the (n/2+1) butterflies */
+     pln->super.super.ops.add += (double)(npairs / VL) * (n / 2 + 1) * 3;
+     pln->super.super.ops.mul += (double)(npairs / VL) * (n / 2 + 1) * 2;
+     pln->super.super.ops.other += (double)(npairs / VL) * (2 * n * (pln->simd ? 1 : VL) + 4 * (n / 2 + 1));
+     return &(pln->super.super);
+
+ nada:
+     X(ifree0)(B);
+     X(plan_destroy_internal)(cldrest);
+     X(plan_destroy_internal)(cldlast);
+     X(plan_destroy_internal)(cld);
+     return (plan *) 0;
+}
+
+static solver *mksolver(void)
+{
+     static const solver_adt sadt = { PROBLEM_RDFT2, mkplan, 0 };
+     S *slv = MKSOLVER(S, &sadt);
+     return &(slv->super);
+}
+
+extern "C" void XSIMD(fftchode_rdft2_pair_register)(planner *p)
+{
+     REGISTER_SOLVER(p, mksolver());
+}
+}
+#undef FFTCHODE_PAIR_BUF_BYTES
 #pragma pop_macro("LD")
 #pragma pop_macro("ST")
 }}

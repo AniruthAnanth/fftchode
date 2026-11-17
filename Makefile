@@ -7,7 +7,7 @@ BUILD    ?= build
 FFTW_VERSION = 3.3.10
 FFTW_SHA256  = 56c932549852cddcfafdab3820b0200c7742675be92179e59e6215b340e26467
 
-.PHONY: all test test-upstream test-matlab clean
+.PHONY: all test test-upstream test-fast test-matlab clean
 
 all: $(BUILD)/fft.o
 
@@ -50,12 +50,19 @@ test-upstream: $(BUILD)/fft_dump $(BUILD)/fft_dump_upstream
 	$(BUILD)/fft_dump_upstream > $(BUILD)/dump_upstream.txt
 	cmp $(BUILD)/dump_fft.txt $(BUILD)/dump_upstream.txt && echo "upstream identity: $$(wc -l < $(BUILD)/dump_fft.txt) cases bit-identical"
 
+# Fast numerics mode: every transform must agree with baseline mode to within roundoff
+$(BUILD)/fast_check: tests/fast_check.cpp $(BUILD)/fft.o
+	$(CXX) -std=c++17 $(CXXFLAGS) -Isrc tests/fast_check.cpp $(BUILD)/fft.o -pthread -lm -o $@
+
+test-fast: $(BUILD)/fast_check
+	$(BUILD)/fast_check
+
 # Comparison with MATLAB ground truth (directory given by GT=..., never stored in this repo)
 test-matlab: $(BUILD)/mlfft
 	@test -n "$(GT)" || (echo "usage: make test-matlab GT=<ground-truth dir>"; exit 2)
 	$(PY) tests/matlab_compare.py $(GT) $(BUILD)/mlfft --csv $(BUILD)/matlab_compare.csv
 
-test: test-upstream
+test: test-upstream test-fast
 
 clean:
 	rm -rf $(BUILD)
