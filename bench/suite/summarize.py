@@ -7,7 +7,7 @@ Inputs (all written by bench/suite/compare.py or fftsuite --mode mem/err, then c
   memory.csv error.csv size.csv
 Every speedup is relative to baseline-v0 built with clang 18 (-O2 -ffp-contract=off) in the same run.
 """
-import csv, math, os, sys
+import csv, math, os, re, sys
 from collections import defaultdict
 
 R = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
@@ -60,6 +60,12 @@ w("Machine: AMD EPYC (Zen 4) cloud VM, 4 cores / 8 threads, AVX-512, 32 GB; Ubun
   "measured in the same interleaved run; 95% confidence intervals come from a paired bootstrap over rounds. "
   "Suites: bench/suite/frozen.txt (128 cases) and bench/suite/heldout.txt (78 cases, never used for tuning). "
   "Planning is FFTW_ESTIMATE unless stated.\n")
+audit = os.path.join(R, "audit", "AUDIT.md")
+if os.path.exists(audit):
+    w(re.sub(r"(?m)^#", "##", open(audit).read()).replace("](ANALYSIS.md)", "](audit/ANALYSIS.md)").replace("](ACCURACY.md)", "](audit/ACCURACY.md)").replace("are in this directory", "are in `bench/results/audit/`"))
+    w("## Original FFTE-6 measurements\n")
+    w("Everything below is the FFTE-6 run as published. Where the fairness audit above corrects a figure (8-thread ratios against baseline-v0 at 8 threads, "
+      "the per-cell-best ratios, FFTW's and AOCL's 8-thread numbers), the audit's figure is the one to cite.\n")
 
 w("## Headline\n")
 w("| build | suite | 1 thread | 8 threads |\n|---|---|---|---|")
@@ -109,7 +115,7 @@ for t in (1, 8):
         g = groups[k]
         e = [x[1] for x in g]; m = [x[2] for x in g]
         allE += e; allM += m; wonE += sum(1 for x in e if x >= 1); wonM += sum(1 for x in m if x >= 1)
-        top = max(set(x[3] for x in g), key=lambda l: sum(1 for x in g if x[3] == l))
+        top = max(sorted(set(x[3] for x in g)), key=lambda l: sum(1 for x in g if x[3] == l))
         w("| %s | %s | %s | %d | %.2f | %.2f | %d | %s |" % (k[0], k[1], k[2], len(g), gm(e), gm(m), sum(1 for x in m if x >= 1), top))
     w("| all | | | %d | %.2f | %.2f | %d | |" % (len(allE), gm(allE), gm(allM), wonM))
     w("\nCells where fftchode (MEASURE) is at least as fast as every comparator: %d of %d; with ESTIMATE: %d.\n" % (wonM, len(allM), wonE))
