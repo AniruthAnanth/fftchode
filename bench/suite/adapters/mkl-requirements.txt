@@ -1,0 +1,11 @@
+# oneMKL 2026.2.1 from PyPI (Intel's official wheels), all wheels pinned by sha256: pip install --require-hashes -r this file
+mkl-devel==2026.2.1 --hash=sha256:88374aff666d6adffc166773a9c8e39a90b737034b90a92108d6f96248c334ab
+mkl-static==2026.2.1 --hash=sha256:5d5023b4452c4e5064595b305d7f7605dfc1ca99811315d09f1c15b9c65277fd
+mkl-include==2026.2.1 --hash=sha256:0c4e6f27b1ee435cc7fac115f6df259eb5be38328428cb73927c68dbac32d39f
+mkl==2026.2.1 --hash=sha256:76322a3abf512594ab7b4e82cb72df91e4e5d195498769aa8b292373c1ddd6d1
+intel-openmp==2026.2.0 --hash=sha256:2308a1a3e74718a9cd8cccf218c34d8cd80b43d3b89dfbb01b38dee205c50980
+intel-cmplr-lib-ur==2026.2.0 --hash=sha256:0d0a5099aa2e1e38375b509c2a8182e719ed74aa656b2a800ddf6cfbd3384b80
+tbb==2023.2.0 --hash=sha256:7d80615b6e970f11671fa05b6eaa9483ac864fbfe525ac280271a78b37870b7c
+tbb-devel==2023.2.0 --hash=sha256:83d004c948614a3d36c10e19e10f9620eeee927cc68cee29442b94ec609e31d0
+tcmlib==1.6.0 --hash=sha256:46c2491988bfd18c4733eeb08aca6a386706a497b92cc51d155f37ddea003c14
+umf==1.2.0 --hash=sha256:238d186fdd9e9c0fe1489da95b19b0b79045fe26c4aa98bd0a022a2a3603c195
