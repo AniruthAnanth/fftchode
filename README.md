@@ -25,6 +25,8 @@ These are geometric-mean speedups on the 128-case frozen suite, measured on an A
 
 The 1- and 8-thread columns are relative to baseline-v0 on 1 thread. The best-thread-count column runs each library and baseline-v0 at their own fastest of 1, 2, 4 and 8 threads per case. Built with `-O3 -march=znver4` instead of the release flags, baseline-v0 gets 1.13x on its own, and baseline mode's 1-thread gain over that build is 1.04x.
 
+These figures are from the fairness audit's run (FFTE-8), before the threading fixes. On a fresh machine of the same type with the audited protocol, the fixes leave the best-thread-count and 1-thread figures unchanged within their CIs: bit-identical 1.42x, fast 3.14x over baseline-v0's best, and the held-out suite gives 1.43x and 3.39x. They speed up bit-identical mode at a fixed 2-8 threads by 2-3%, and by 33-42% when other load shares the CPUs (fast mode: 31-35%). Small problems no longer run much slower at 8 threads than at 1 ([`bench/results/threads/`](bench/results/threads/README.md)).
+
 At matched planning levels (MKL excluded), fftchode reaches a geometric-mean ratio to the fastest library in each case of 1.00 at 1 thread and 1.23 at 8 threads with ESTIMATE, and 0.91 and 1.05 with MEASURE. With the thread pool, FFTW MEASURE comes within 1.24–1.38x of fftchode fast mode at 8 threads. AOCL-FFTW's app-opt planner, which searches for seconds to hours, is 1.15x faster than fftchode MEASURE at 1 thread. The audit also covers planning time, CPU time and accuracy.
 
 ## Build
@@ -40,6 +42,8 @@ The only dependencies are the C++ standard library, libm and pthreads. No `-m` f
 ## Usage
 
 Include `fftchode.h` where you would include `fftw3.h`, and link `build/libfftchode.a -pthread`. Select the mode with `fftchode_set_numerics(0)` (baseline) or `fftchode_set_numerics(1)` (fast) before the first plan, or with `FFTCHODE_NUMERICS=baseline|fast` in the environment.
+
+With `fftw_plan_with_nthreads(T)`, a small problem is planned for fewer threads: at most one per `FFTCHODE_THREAD_WORK` flops of rough work (default 32768, 0 turns the cap off), rounded down to a power of two. In baseline mode this happens only when the plan for fewer threads computes the same bits as FFTW's plan for T threads, and the exported wisdom stays FFTW's.
 
 ## Tests
 
