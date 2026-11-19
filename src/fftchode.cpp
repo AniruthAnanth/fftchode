@@ -468079,12 +468079,12 @@ static int serial_plan_p(const problem *prb)
 
 /* fftchode, both numerics modes: a problem is planned for at most one thread
    per FFTCHODE_THREAD_WORK flops of rough work (default 32768; 0 turns the
-   cap off).  Below that, the hand-offs and the extra passes of the threaded
-   solvers cost more than the threads save. */
+   cap off), rounded down to a power of two.  Below that, the hand-offs and
+   the extra passes of the threaded solvers cost more than the threads save. */
 static int thread_cap(const problem *prb, int nthr)
 {
      static double per = -1;
-     int loop;
+     int loop, cap;
      double f;
 
      if (per < 0)
@@ -468092,14 +468092,17 @@ static int thread_cap(const problem *prb, int nthr)
      f = rough_work(prb, &loop);
      if (nthr <= 1 || per <= 0 || f < 0 || f >= per * nthr)
 	  return nthr;
-     return f < 2 * per ? 1 : (int)(f / per);
+     for (cap = 1; 2 * cap * per <= f; cap *= 2)
+	  ;
+     return cap;
 }
 
 /* Canonical form of a printed plan, up to its split over threads: vector
    lengths ("-x8") are dropped, a threaded solver becomes its serial
    counterpart with repeated children merged (the blocks of a threaded loop
-   run the same child on different parts of the data), and a vector loop with
-   a single kind of child becomes that child.  Two plans of one problem with
+   run the same child on different parts of the data), a rank-0 plan (a pure
+   copy, exact in any order) becomes "rank0", and a vector loop with a single
+   kind of child becomes that child.  Two plans of one problem with
    the same canonical form run the same codelets on the same elements, so they
    compute the same output bits. */
 static std::string canon_plan(const char *&s)
@@ -468123,6 +468126,8 @@ static std::string canon_plan(const char *&s)
      }
      if (*s == ')') ++s;
 
+     if (label.find("-rank0") != std::string::npos)
+	  return "(rank0)";
      thr = (k = label.find("-thr")) != std::string::npos;
      if (thr) label.erase(k, 4);
      for (k = 0; (k = label.find("-x", k)) != std::string::npos;) {
