@@ -468140,12 +468140,11 @@ static std::string canon_plan(const char *&s)
      return out + ")";
 }
 
-static std::string plan_signature(plan *pln)
+static std::string plan_string(plan *pln)
 {
      size_t cnt;
      printer *pr = X(mkprinter_cnt)(&cnt);
      std::string buf;
-     const char *s;
 
      pln->adt->print(pln, pr);
      X(printer_destroy)(pr);
@@ -468153,7 +468152,12 @@ static std::string plan_signature(plan *pln)
      pr = X(mkprinter_str)(&buf[0]);
      pln->adt->print(pln, pr);
      X(printer_destroy)(pr);
-     s = buf.c_str();
+     return buf;
+}
+
+static std::string plan_signature(const std::string &printed)
+{
+     const char *s = printed.c_str();
      return canon_plan(s);
 }
 
@@ -468234,12 +468238,15 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
 	     that of the requested count too: the capped plan is not blessed. */
 	  if (!fftchode_numerics_mode()) {
 	       int nthr = plnr->nthr, cap = thread_cap(prb, nthr);
-	       if (cap < nthr) {
+	       std::string ref;
+	       if (cap < nthr
+		   && (ref = plan_string(p->pln)).find("-thr") != std::string::npos) {
 		    plan *c;
+		    ref = plan_signature(ref);
 		    plnr->nthr = cap;
 		    c = mkplan(plnr, flags_used_for_planning, prb, 0u);
 		    plnr->nthr = nthr;
-		    if (c && plan_signature(c) == plan_signature(p->pln)) {
+		    if (c && plan_signature(plan_string(c)) == ref) {
 			 X(plan_destroy_internal)(p->pln);
 			 p->pln = c;
 		    } else if (c)
