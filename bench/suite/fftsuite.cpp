@@ -2,8 +2,9 @@
 // FFTW_ESTIMATE through the FFTW3 API and measures plan time and execution time separately.
 // Links against any FFTW3-API object: this repo's fftchode.o (any revision) or upstream libfftw3[f].
 //
-//   fftsuite --suite FILE --threads N [--mode time|mem|hash|err] [--batches K] [--tmin S] [--only NAME]
-//            [--plan estimate|measure|patient]   (default estimate; MATLAB's mode)
+//   fftsuite --suite FILE --threads N [--mode time|mem|hash|plan|err] [--batches K] [--tmin S] [--only NAME]
+//            [--plan estimate|measure|patient]   (default estimate; MATLAB's mode)  [--pool spin]
+//   --pool spin  route FFTW's parallel loops through fftw_threads_set_callback to a persistent pool (see SpinPool)
 //
 // Case line:  name prec kind shape howmany layout place
 //   prec  d|s        kind  cf (c2c fwd) cb (c2c bwd) rf (r2c) rb (c2r)
@@ -11,13 +12,13 @@
 //   layout contig (batch dist = one array) | col (rank 1 only: transform along dim 2 of a
 //          howmany x n column-major matrix, stride howmany, dist 1, as MATLAB fft(x,[],2))
 //   place oop|ip     (ip only for c2c)
-// time: name threads plan_s iters t_1..t_K   (seconds per transform)
+// time: name threads plan_s iters t_1..t_K cpu c_1..c_K  (wall and process CPU seconds per transform)
 // mem : name threads heap_live_after_plan heap_peak_plan_exec (bytes above the I/O buffers)
 // hash: name threads fnv64(output)   err (needs -DFFTSUITE_REF and libfftw3l): name rel_rms rel_max
 #if __has_include("fftchode.h")
 #include "fftchode.h"
 #else
-#include <fftchode.h>
+#include <fftw3.h>
 #endif
 #include <cmath>
 #include <cstdint>
@@ -28,6 +29,11 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <sched.h>
 #if defined(__x86_64__)
 #include <xmmintrin.h>
 #include <pmmintrin.h>
@@ -36,6 +42,7 @@
 static unsigned g_flags = FFTW_ESTIMATE;
 extern "C" { int mt_enabled(void); long mt_live(void); long mt_peak(void); void mt_reset_peak(void); }
 
+static double cpu_now() { timespec t; clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static uint64_t fnv(const void *p, size_t n) {
     const unsigned char *c = (const unsigned char *)p; uint64_t h = 1469598103934665603ull;
@@ -67,6 +74,7 @@ template <> struct Api<T> {                                                     
     static void destroy(plan p) { P##destroy_plan(p); }                                              \
     static void threads(int n) { P##plan_with_nthreads(n); }                                         \
     static void cleanup() { P##cleanup(); }                                                          \
+    static char *sprint(plan p) { return P##sprint_plan(p); }                                                          \
 };
 FFTSUITE_API(double, fftw_, d)
 FFTSUITE_API(float, fftwf_, s)
@@ -163,6 +171,62 @@ static bool parse(const std::string &line, Case &c) {
     return true;
 }
 
+
+// --pool spin: FFTW 3.3.10's fftw_threads_set_callback backed by a persistent pool with the same wait policy as
+// fftchode's own pool (workers spin 100 us for new work before sleeping, the caller spins 1 ms while joining).
+// Without it, upstream FFTW wakes its workers through semaphores on every parallel loop.
+struct SpinPool {
+    std::vector<std::thread> th; std::mutex m; std::condition_variable cv;
+    std::atomic<unsigned long> gen{0}; std::atomic<int> next{0}, done{0}, active{0}, sleepers{0}; std::atomic<bool> busy{false}, quit{false};
+    void *(*work)(char *) = nullptr; char *jd = nullptr; size_t el = 0; int nj = 0;
+    static thread_local bool in_worker;
+    static void relax() {
+#if defined(__x86_64__)
+        _mm_pause();
+#endif
+    }
+    void claim() {
+        for (;;) { int i = next.fetch_add(1, std::memory_order_acq_rel); if (i >= nj) break; work(jd + el * (size_t)i); done.fetch_add(1, std::memory_order_acq_rel); }
+    }
+    void worker() {
+        in_worker = true; unsigned long seen = 0;
+        while (!quit.load(std::memory_order_acquire)) {
+            double t0 = now();
+            while (gen.load(std::memory_order_acquire) == seen && !quit.load(std::memory_order_relaxed)) {
+                if (now() - t0 > 100e-6) {
+                    std::unique_lock<std::mutex> lk(m); sleepers++;
+                    cv.wait(lk, [&] { return gen.load() != seen || quit.load(); }); sleepers--; break;
+                }
+                relax();
+            }
+            unsigned long g = gen.load(std::memory_order_acquire); if (g == seen) continue;
+            active.fetch_add(1, std::memory_order_acq_rel);
+            if (gen.load(std::memory_order_acquire) == g) { seen = g; claim(); }
+            active.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+    ~SpinPool() { if (!th.empty()) stop(); }
+    void start(int n) { for (int i = 1; i < n; i++) th.emplace_back([this] { worker(); }); }
+    void stop() { { std::lock_guard<std::mutex> lk(m); quit = true; } cv.notify_all(); for (auto &t : th) t.join(); th.clear(); }
+    void loop(void *(*w)(char *), char *jobdata, size_t elsize, int njobs) {
+        bool exp = false;
+        if (in_worker || th.empty() || njobs <= 1 || !busy.compare_exchange_strong(exp, true)) {
+            for (int i = 0; i < njobs; i++) w(jobdata + elsize * (size_t)i);
+            return;
+        }
+        work = w; jd = jobdata; el = elsize; nj = njobs; done.store(0); next.store(0, std::memory_order_release);
+        { std::lock_guard<std::mutex> lk(m); gen.fetch_add(1, std::memory_order_acq_rel); }
+        if (sleepers.load()) cv.notify_all();
+        claim();
+        double t0 = now();
+        while (done.load(std::memory_order_acquire) < njobs || active.load(std::memory_order_acquire) != 0) { if (now() - t0 > 1e-3) sched_yield(); else relax(); }
+        busy.store(false, std::memory_order_release);
+    }
+};
+thread_local bool SpinPool::in_worker = false;
+static SpinPool g_pool;
+static void pool_cb(void *(*w)(char *), char *jobdata, size_t elsize, int njobs, void *) { g_pool.loop(w, jobdata, elsize, njobs); }
+
 static int g_batches = 3, g_threads = 1; static double g_tmin = 0.02;
 
 template <typename T> static void run_time(const Case &c) {
@@ -172,11 +236,14 @@ template <typename T> static void run_time(const Case &c) {
     for (;;) { double t0 = now(); for (long i = 0; i < iters; i++) Api<T>::exec(P.p); double t = now() - t0;
                if (t >= g_tmin || iters >= (1L << 30)) break; iters *= 2; }
     printf("%s %d %.9g %ld", c.name.c_str(), g_threads, P.plan_s, iters);
+    std::vector<double> cpu(g_batches);
     for (int b = 0; b < g_batches; b++) {
         restore(P);
-        double t0 = now(); for (long i = 0; i < iters; i++) Api<T>::exec(P.p); double t = now() - t0;
+        double c0 = cpu_now(), t0 = now(); for (long i = 0; i < iters; i++) Api<T>::exec(P.p); double t = now() - t0;
+        cpu[b] = (cpu_now() - c0) / iters;
         printf(" %.9g", t / iters);
     }
+    printf(" cpu"); for (double x : cpu) printf(" %.9g", x);
     printf("\n"); fflush(stdout);
     destroy(P);
 }
@@ -199,6 +266,13 @@ template <typename T> static void run_hash(const Case &c) {
     printf("%s %d %016llx\n", c.name.c_str(), g_threads, (unsigned long long)fnv(P.out, sizeof(T) * P.g.out_len)); fflush(stdout);
     destroy(P);
 }
+template <typename T> static void run_plan(const Case &c) {
+    Prob<T> P; if (!make<T>(c, P, false)) { printf("%s %d FAIL\n", c.name.c_str(), g_threads); return; }
+    char *s = Api<T>::sprint(P.p);
+    for (char *q = s; *q; q++) if (*q == '\n') *q = ' ';
+    printf("%s %d %s\n", c.name.c_str(), g_threads, s); fflush(stdout);
+    free(s); destroy(P);
+}
 #ifdef FFTSUITE_REF
 template <typename T> static void run_err(const Case &c) {
     Prob<T> P; if (!make<T>(c, P, true)) { printf("%s FAIL\n", c.name.c_str()); return; }
@@ -216,7 +290,7 @@ template <typename T> static void run_err(const Case &c) {
 #endif
 
 int main(int argc, char **argv) {
-    const char *suite = nullptr, *mode = "time", *only = nullptr;
+    const char *suite = nullptr, *mode = "time", *only = nullptr; bool use_pool = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--suite")) suite = argv[++i];
         else if (!strcmp(argv[i], "--threads")) g_threads = atoi(argv[++i]);
@@ -224,16 +298,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--batches")) g_batches = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tmin")) g_tmin = atof(argv[++i]);
         else if (!strcmp(argv[i], "--only")) only = argv[++i];
+        else if (!strcmp(argv[i], "--pool")) use_pool = !strcmp(argv[++i], "spin");
         else if (!strcmp(argv[i], "--plan")) { const char *m = argv[++i];
             g_flags = !strcmp(m, "measure") ? FFTW_MEASURE : !strcmp(m, "patient") ? FFTW_PATIENT : FFTW_ESTIMATE; }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!suite) { fprintf(stderr, "usage: fftsuite --suite FILE [--threads N] [--mode time|mem|hash|err]\n"); return 2; }
+    if (!suite) { fprintf(stderr, "usage: fftsuite --suite FILE [--threads N] [--mode time|mem|hash|plan|err]\n"); return 2; }
 #if defined(__x86_64__)
     if (!strcmp(mode, "time")) { _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON); _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON); }
 #endif
     fftw_init_threads(); fftwf_init_threads();
     fftw_plan_with_nthreads(g_threads); fftwf_plan_with_nthreads(g_threads);
+    if (use_pool && g_threads > 1) { g_pool.start(g_threads); fftw_threads_set_callback(pool_cb, nullptr); fftwf_threads_set_callback(pool_cb, nullptr); }
 #ifdef FFTSUITE_REF
     fftwl_init_threads(); fftwl_plan_with_nthreads(1);
 #endif
@@ -247,6 +323,7 @@ int main(int argc, char **argv) {
         if (!strcmp(mode, "time")) d ? run_time<double>(c) : run_time<float>(c);
         else if (!strcmp(mode, "mem")) d ? run_mem<double>(c) : run_mem<float>(c);
         else if (!strcmp(mode, "hash")) d ? run_hash<double>(c) : run_hash<float>(c);
+        else if (!strcmp(mode, "plan")) d ? run_plan<double>(c) : run_plan<float>(c);
 #ifdef FFTSUITE_REF
         else if (!strcmp(mode, "err")) d ? run_err<double>(c) : run_err<float>(c);
 #endif
