@@ -579,9 +579,13 @@ FFTW_DEFINE_API(FFTW_MANGLE_QUAD, __float128, fftwq_complex)
  * fftchode_set_numerics() was called before.  Each mode has its own planner and
  * wisdom; plans made in one mode stay valid after a switch.  Switch modes between
  * planner calls, not concurrently with planning in another thread. */
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 static std::atomic<int> fftchode_numerics_{-1};
 extern "C" void fftchode_set_numerics(int mode)
 {
@@ -468023,9 +468027,11 @@ static double env_work(const char *name, double dflt)
      return (s && *s) ? atof(s) : dflt;
 }
 
-static int serial_plan_p(const problem *prb)
+/* Rough flop count of a problem: 5 n log2 n per complex transform, half that
+   for a real one, times the number of transforms; -1 when it has none.
+   *loop says whether it is a loop of transforms or a multi-d transform. */
+static double rough_work(const problem *prb, int *loop)
 {
-     static double min_vec = -1, min_1d = -1;
      const tensor *sz, *vecsz;
      double f, n, v;
 
@@ -468049,15 +468055,106 @@ static int serial_plan_p(const problem *prb)
 	      return 0;
      }
      if (!FINITE_RNK(sz->rnk) || !FINITE_RNK(vecsz->rnk))
+	  return -1;
+     n = (double) X(tensor_sz)(sz);
+     v = (double) X(tensor_sz)(vecsz);
+     *loop = v > 1 || sz->rnk > 1;
+     return f * n * (n > 2 ? log2(n) : 1) * v;
+}
+
+static int serial_plan_p(const problem *prb)
+{
+     static double min_vec = -1, min_1d = -1;
+     int loop;
+     double f = rough_work(prb, &loop);
+
+     if (f < 0)
 	  return 0;
      if (min_vec < 0) {
 	  min_1d = env_work("FFTCHODE_THREAD_SERIAL_WORK_1D", 524288);
 	  min_vec = env_work("FFTCHODE_THREAD_SERIAL_WORK", 131072);
      }
-     n = (double) X(tensor_sz)(sz);
-     v = (double) X(tensor_sz)(vecsz);
-     f *= n * (n > 2 ? log2(n) : 1) * v;
-     return f < ((v > 1 || sz->rnk > 1) ? min_vec : min_1d);
+     return f < (loop ? min_vec : min_1d);
+}
+
+/* fftchode, both numerics modes: a problem is planned for at most one thread
+   per FFTCHODE_THREAD_WORK flops of rough work (default 32768; 0 turns the
+   cap off).  Below that, the hand-offs and the extra passes of the threaded
+   solvers cost more than the threads save. */
+static int thread_cap(const problem *prb, int nthr)
+{
+     static double per = -1;
+     int loop;
+     double f;
+
+     if (per < 0)
+	  per = env_work("FFTCHODE_THREAD_WORK", 32768);
+     f = rough_work(prb, &loop);
+     if (nthr <= 1 || per <= 0 || f < 0 || f >= per * nthr)
+	  return nthr;
+     return f < 2 * per ? 1 : (int)(f / per);
+}
+
+/* Canonical form of a printed plan, up to its split over threads: vector
+   lengths ("-x8") are dropped, a threaded solver becomes its serial
+   counterpart with repeated children merged (the blocks of a threaded loop
+   run the same child on different parts of the data), and a vector loop with
+   a single kind of child becomes that child.  Two plans of one problem with
+   the same canonical form run the same codelets on the same elements, so they
+   compute the same output bits. */
+static std::string canon_plan(const char *&s)
+{
+     std::string label, out;
+     std::vector<std::string> kids;
+     bool thr, vrank;
+     size_t k;
+
+     while (*s == ' ' || *s == '\n') ++s;
+     if (*s != '(') {
+	  while (*s && *s != ' ' && *s != '\n' && *s != ')') out += *s++;
+	  return out;
+     }
+     ++s;
+     while (*s && *s != ' ' && *s != '\n' && *s != ')') label += *s++;
+     for (;;) {
+	  while (*s == ' ' || *s == '\n') ++s;
+	  if (!*s || *s == ')') break;
+	  kids.push_back(canon_plan(s));
+     }
+     if (*s == ')') ++s;
+
+     thr = (k = label.find("-thr")) != std::string::npos;
+     if (thr) label.erase(k, 4);
+     for (k = 0; (k = label.find("-x", k)) != std::string::npos;) {
+	  size_t e = k + 2;
+	  while (e < label.size() && isdigit((unsigned char) label[e])) ++e;
+	  if (e > k + 2) label.erase(k, e - k); else k += 2;
+     }
+     if (thr)
+	  kids.erase(std::unique(kids.begin(), kids.end()), kids.end());
+     vrank = label.find("vrank") != std::string::npos;
+     if (vrank && kids.size() == 1 && kids[0][0] == '(')
+	  return kids[0];
+     out = "(" + label;
+     for (k = 0; k < kids.size(); ++k) out += " " + kids[k];
+     return out + ")";
+}
+
+static std::string plan_signature(plan *pln)
+{
+     size_t cnt;
+     printer *pr = X(mkprinter_cnt)(&cnt);
+     std::string buf;
+     const char *s;
+
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     buf.resize(cnt + 1);
+     pr = X(mkprinter_str)(&buf[0]);
+     pln->adt->print(pln, pr);
+     X(printer_destroy)(pr);
+     s = buf.c_str();
+     return canon_plan(s);
 }
 
 extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
@@ -468078,9 +468175,8 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
      plnr = X(the_planner)();
 
      nthr_save = plnr->nthr;
-     if (nthr_save > 1 && fftchode_numerics_mode() == 1
-	 && serial_plan_p(prb))
-	  plnr->nthr = 1;
+     if (nthr_save > 1 && fftchode_numerics_mode() == 1)
+	  plnr->nthr = serial_plan_p(prb) ? 1 : thread_cap(prb, nthr_save);
 
      if (flags & FFTW_WISDOM_ONLY) {
 	  /* Special mode that returns a plan only if wisdom is present,
@@ -468128,6 +468224,29 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
 	  /* re-create plan from wisdom, adding blessing */
 	  p->pln = mkplan(plnr, flags_used_for_planning, prb, BLESSING);
 
+	  /* we don't use pln for p->pln, above, since by re-creating the
+	     plan we might use more patient wisdom from a timed-out mkplan */
+	  X(plan_destroy_internal)(pln);
+
+	  /* fftchode baseline mode: thread_cap applies only when the plan for
+	     fewer threads is the same computation as the plan for the requested
+	     count, so the output stays FFTW's at that count.  The wisdom stays
+	     that of the requested count too: the capped plan is not blessed. */
+	  if (!fftchode_numerics_mode()) {
+	       int nthr = plnr->nthr, cap = thread_cap(prb, nthr);
+	       if (cap < nthr) {
+		    plan *c;
+		    plnr->nthr = cap;
+		    c = mkplan(plnr, flags_used_for_planning, prb, 0u);
+		    plnr->nthr = nthr;
+		    if (c && plan_signature(c) == plan_signature(p->pln)) {
+			 X(plan_destroy_internal)(p->pln);
+			 p->pln = c;
+		    } else if (c)
+			 X(plan_destroy_internal)(c);
+	       }
+	  }
+
 	  /* record pcost from most recent measurement for use in X(cost) */
 	  p->pln->pcost = pcost;
 
@@ -468139,10 +468258,6 @@ extern "C" apiplan *X(mkapiplan)(int sign, unsigned flags, problem *prb)
 	       /* more accurate */
 	       X(plan_awake)(p->pln, AWAKE_SINCOS);
 	  }
-
-	  /* we don't use pln for p->pln, above, since by re-creating the
-	     plan we might use more patient wisdom from a timed-out mkplan */
-	  X(plan_destroy_internal)(pln);
      } else
 	  X(problem_destroy)(prb);
 
@@ -475851,11 +475966,33 @@ template <class F> static bool spin_until(F ready, long spin_ns)
      }
 }
 
+/* The blocks of one loop are split into a contiguous range per lane.  A
+   lane claims the blocks of its own range one at a time, then those left in
+   the other lanes' ranges, so a lane whose CPU is busy elsewhere does not
+   hold up the loop. */
+struct lane {
+     std::atomic<int> next;   /* next unclaimed block of this range */
+     int end;
+     char pad[64 - sizeof(std::atomic<int>) - sizeof(int)];
+};
+
 struct work {
      spawn_function proc;
      spawn_data *d;
-     int nd;
+     struct lane *lanes;
+     int nlanes;
+     int self;
 };
+
+static void run_blocks(struct work *w)
+{
+     int i, k;
+     for (k = 0; k < w->nlanes; ++k) {
+	  struct lane *l = &w->lanes[(w->self + k) % w->nlanes];
+	  while ((i = l->next.fetch_add(1, std::memory_order_relaxed)) < l->end)
+	       w->proc(&w->d[i]);
+     }
+}
 
 struct worker {
      char pad0[64];
@@ -475947,13 +476084,11 @@ static FFTW_WORKER worker(void *arg)
 
      for (;;) {
 	  struct work *w = take_work(ego);
-	  int i;
 
 	  /* !w->proc ==> terminate worker */
 	  if (!w->proc) break;
 
-	  for (i = 0; i < w->nd; ++i)
-	       w->proc(&w->d[i]);
+	  run_blocks(w);
 
 	  ego->finished.store(1, std::memory_order_seq_cst);
 	  if (ego->waiting.load(std::memory_order_seq_cst))
@@ -476095,18 +476230,22 @@ static void spawn_loop_lanes(int loopmax, int nthr, spawn_function proc, void *d
 	       proc(&sdata[i]);
      } else {
 	  struct work *r;
+	  struct lane *ls;
 	  struct worker **qs;
 	  int j;
 
 	  STACK_MALLOC(struct work *, r, sizeof(struct work) * nlanes);
+	  STACK_MALLOC(struct lane *, ls, sizeof(struct lane) * nlanes);
 	  STACK_MALLOC(struct worker **, qs, sizeof(struct worker *) * nlanes);
 
 	  for (j = 0; j < nlanes; ++j) {
-	       int lo = (int)(((long long)j * nthr) / nlanes);
-	       int hi = (int)(((long long)(j + 1) * nthr) / nlanes);
+	       new (&ls[j].next) std::atomic<int>((int)(((long long)j * nthr) / nlanes));
+	       ls[j].end = (int)(((long long)(j + 1) * nthr) / nlanes);
 	       r[j].proc = proc;
-	       r[j].d = sdata + lo;
-	       r[j].nd = hi - lo;
+	       r[j].d = sdata;
+	       r[j].lanes = ls;
+	       r[j].nlanes = nlanes;
+	       r[j].self = j;
 	  }
 
 	  WITH_QUEUE_LOCK({
@@ -476125,12 +476264,13 @@ static void spawn_loop_lanes(int loopmax, int nthr, spawn_function proc, void *d
 	       post_work(qs[j], &r[j]);
 	  }
 
-	  /* do the last lane ourselves */
-	  for (i = 0; i < r[nlanes - 1].nd; ++i)
-	       proc(&r[nlanes - 1].d[i]);
+	  /* the caller runs the last lane; a worker that has not taken its
+	     lane by the time every block is claimed is not waited for */
+	  run_blocks(&r[nlanes - 1]);
 
 	  for (j = 0; j < nlanes - 1; ++j)
-	       join_worker(qs[j]);
+	       if (qs[j]->pending.exchange((struct work *)0, std::memory_order_acq_rel) != &r[j])
+		    join_worker(qs[j]);
 
 	  /* push back in reverse so that the next loop hands lane j to the
 	     same worker (and its warm cache) again */
@@ -476143,6 +476283,7 @@ static void spawn_loop_lanes(int loopmax, int nthr, spawn_function proc, void *d
 	  spare_lanes.fetch_add(nlanes - 1, std::memory_order_release);
 
 	  STACK_FREE(qs);
+	  STACK_FREE(ls);
 	  STACK_FREE(r);
      }
      STACK_FREE(sdata);
