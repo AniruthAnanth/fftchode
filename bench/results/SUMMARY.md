@@ -2,6 +2,26 @@
 
 Machine: AMD EPYC (Zen 4) cloud VM, 4 cores / 8 threads, AVX-512, 32 GB; Ubuntu 24.04, clang 18.1.3. Every figure is a geometric-mean speedup over baseline-v0 (FFTW 3.3.10 scalar in one file, clang -O2 -ffp-contract=off) measured in the same interleaved run; 95% confidence intervals come from a paired bootstrap over rounds. Suites: bench/suite/frozen.txt (128 cases) and bench/suite/heldout.txt (78 cases, never used for tuning). Planning is FFTW_ESTIMATE unless stated.
 
+## Threading fixes (FFTE-9)
+
+[threads/README.md](threads/README.md) has the method, every table and the per-case CSVs. fftchode's pool now lets lanes take each other's unclaimed blocks, and each plan gets a work-based thread cap (at most one thread per 32768 rough flops, rounded down to a power of two), in both numerics modes. In baseline mode a capped plan is used only when it is the same computation as the plan at the requested count, so outputs and wisdom stay bit-identical to FFTW at that count (test-upstream 4020/4020; frozen and held-out hashes equal baseline-v0 at 1-8 threads). Peak heap is no worse in any case.
+
+These figures come from the audited protocol on a fresh machine of the audit's type (3 rounds, A/A within 0.994-1.014). They are geomeans over baseline-v0 at 1 thread, and the first column of each pair is the frozen suite, the second the held-out suite:
+
+| mode | 1 thread | 8 threads | best thread count | best T vs baseline-v0 best T |
+|---|---|---|---|---|
+| bit-identical | 1.186 / 1.201 | 3.03 / 2.98 | 3.09 / 3.14 | 1.42 / 1.43 |
+| fast | 3.04 / 3.48 | 6.66 / 7.25 | 6.84 / 7.42 | 3.14 / 3.39 |
+
+- **Effect against the previous build on the same machine:**
+  - Bit-identical: 0.999 at 1 thread and 1.027-1.028 at 2, 4 and 8 threads.
+  - Fast: 1.008 at 1 thread and 0.990 at 8 threads, a 1% cost of stealing without contention.
+- **Cells slower than 1 thread:** bit-identical mode's cells at T threads that run below 0.67x of 1 thread drop from 2/4/4 to 0/0/0 at T = 2/4/8.
+- **Under a CPU hog on half the CPUs:**
+  - Bit-identical mode goes from 0.99/1.24/1.67 to 1.41/1.69/2.23 at 2/4/8 threads, and fast mode from 2.61/3.11/3.83 to 3.54/4.07/5.01.
+  - In bit-identical mode, no cell stays below 0.67x of its 1-thread time (before: 20/16/14 cells, worst 0.11x).
+- **Defect 1 was noise.** The audit's d_rb1048576 at 0.58x has identical plans and measures 1.12x (1.10-1.13) over 20 interleaved rounds. With 3 rounds, the A/A copy itself has 34-49 cells whose per-case CI excludes 1, so per-case "below 1 at 95%" flags are not evidence at that round count.
+
 ## Fairness audit of the benchmark comparisons (FFTE-8)
 
 This audit re-measured every comparison behind the FFTE-6 claims on the same machine type: an AMD EPYC Zen 4 KVM guest (lscpu family 25 model 17) with 8 logical CPUs, which are 4 physical cores with 2 SMT threads each (siblings 0/1, 2/3, 4/5, 6/7), AVX-512, 32 GB, Ubuntu 24.04, clang 18.1.3 and gcc 13.3.0. No Intel machine was reachable: a fresh cloud machine also reported AMD EPYC. Per-case data and the scripts are in `bench/results/audit/` and in `bench/suite/audit/`. [ANALYSIS.md](audit/ANALYSIS.md) has the full thread-sweep tables and [ACCURACY.md](audit/ACCURACY.md) the error table.

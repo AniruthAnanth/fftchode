@@ -2,7 +2,7 @@
 // FFTW_ESTIMATE through the FFTW3 API and measures plan time and execution time separately.
 // Links against any FFTW3-API object: this repo's fftchode.o (any revision) or upstream libfftw3[f].
 //
-//   fftsuite --suite FILE --threads N [--mode time|mem|hash|err] [--batches K] [--tmin S] [--only NAME]
+//   fftsuite --suite FILE --threads N [--mode time|mem|hash|plan|err] [--batches K] [--tmin S] [--only NAME]
 //            [--plan estimate|measure|patient]   (default estimate; MATLAB's mode)  [--pool spin]
 //   --pool spin  route FFTW's parallel loops through fftw_threads_set_callback to a persistent pool (see SpinPool)
 //
@@ -74,6 +74,7 @@ template <> struct Api<T> {                                                     
     static void destroy(plan p) { P##destroy_plan(p); }                                              \
     static void threads(int n) { P##plan_with_nthreads(n); }                                         \
     static void cleanup() { P##cleanup(); }                                                          \
+    static char *sprint(plan p) { return P##sprint_plan(p); }                                                          \
 };
 FFTSUITE_API(double, fftw_, d)
 FFTSUITE_API(float, fftwf_, s)
@@ -265,6 +266,13 @@ template <typename T> static void run_hash(const Case &c) {
     printf("%s %d %016llx\n", c.name.c_str(), g_threads, (unsigned long long)fnv(P.out, sizeof(T) * P.g.out_len)); fflush(stdout);
     destroy(P);
 }
+template <typename T> static void run_plan(const Case &c) {
+    Prob<T> P; if (!make<T>(c, P, false)) { printf("%s %d FAIL\n", c.name.c_str(), g_threads); return; }
+    char *s = Api<T>::sprint(P.p);
+    for (char *q = s; *q; q++) if (*q == '\n') *q = ' ';
+    printf("%s %d %s\n", c.name.c_str(), g_threads, s); fflush(stdout);
+    free(s); destroy(P);
+}
 #ifdef FFTSUITE_REF
 template <typename T> static void run_err(const Case &c) {
     Prob<T> P; if (!make<T>(c, P, true)) { printf("%s FAIL\n", c.name.c_str()); return; }
@@ -295,7 +303,7 @@ int main(int argc, char **argv) {
             g_flags = !strcmp(m, "measure") ? FFTW_MEASURE : !strcmp(m, "patient") ? FFTW_PATIENT : FFTW_ESTIMATE; }
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
-    if (!suite) { fprintf(stderr, "usage: fftsuite --suite FILE [--threads N] [--mode time|mem|hash|err]\n"); return 2; }
+    if (!suite) { fprintf(stderr, "usage: fftsuite --suite FILE [--threads N] [--mode time|mem|hash|plan|err]\n"); return 2; }
 #if defined(__x86_64__)
     if (!strcmp(mode, "time")) { _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON); _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON); }
 #endif
@@ -315,6 +323,7 @@ int main(int argc, char **argv) {
         if (!strcmp(mode, "time")) d ? run_time<double>(c) : run_time<float>(c);
         else if (!strcmp(mode, "mem")) d ? run_mem<double>(c) : run_mem<float>(c);
         else if (!strcmp(mode, "hash")) d ? run_hash<double>(c) : run_hash<float>(c);
+        else if (!strcmp(mode, "plan")) d ? run_plan<double>(c) : run_plan<float>(c);
 #ifdef FFTSUITE_REF
         else if (!strcmp(mode, "err")) d ? run_err<double>(c) : run_err<float>(c);
 #endif

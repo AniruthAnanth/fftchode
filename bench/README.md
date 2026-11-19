@@ -14,7 +14,9 @@ There are two harnesses. The committed results in `bench/results/` come from the
 
 ## Comparators and the fairness audit (`bench/suite/adapters/`, `bench/suite/audit/`)
 
-`bench/suite/comparators.sh <outdir>` fetches and builds every comparator (FFTW 3.3.10 with its own flags and with clang `-O2 -ffp-contract=off`, AOCL-FFTW 6.0.0 with and without app-opt, oneMKL, ducc0, pocketfft, PFFFT, KissFFT, FFTE) and one harness binary per library; `adapters/README.md` describes each adapter. FFTW-API binaries take `--plan estimate|measure|patient` and `--pool spin`, which installs `fftw_threads_set_callback` with a persistent pool using fftchode's wait policy. Every timing line carries process CPU time after the `cpu` marker, and `compare.py` pins N threads to one SMT sibling per core before any second sibling.
+`bench/suite/comparators.sh <outdir>` fetches and builds every comparator (FFTW 3.3.10 with its own flags and with clang `-O2 -ffp-contract=off`, AOCL-FFTW 6.0.0 with and without app-opt, oneMKL, ducc0, pocketfft, PFFFT, KissFFT, FFTE) and one harness binary per library; `adapters/README.md` describes each adapter. FFTW-API binaries take `--plan estimate|measure|patient` and `--pool spin`, which installs `fftw_threads_set_callback` with a persistent pool using fftchode's wait policy. Every timing line carries process CPU time after the `cpu` marker, and `compare.py` pins N threads to one SMT sibling per core before any second sibling. `--mode plan` prints each case's plan (`fftw_sprint_plan`).
+
+The threading runs (FFTE-9, `bench/results/threads/`) use `bench/suite/audit/run_threads.sh <outdir> base=<baseline-v0 binary> fc-v1=<old fftchode> fc=<new fftchode>`. It runs both numerics modes at 1, 2, 4 and 8 threads on both suites, and then the frozen suite with a CPU hog (`audit/hog.c`) on cpus 4-7. `bench/suite/analyze_threads.py <outdir>/frozen --pairs fc-bit=fc-bit-v1` reports every build against baseline-v0 at 1 thread and at its best thread count, and counts the cells slower than the build's own 1-thread time.
 
 The fairness audit (FFTE-8) is reproduced with:
 
